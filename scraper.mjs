@@ -1,9 +1,8 @@
 import { chromium } from 'playwright';
 
-const NAV_TIMEOUT = 10000;      // snel falen i.p.v. hangen
+const NAV_TIMEOUT = 10000;   // keep tight so we fail fast instead of hanging
 const SHORT_TIMEOUT = 600;
-const SCAN_BUDGET_MS = 9000;    // totale zoektijd op de pagina
-const CHUNK_SCROLL_PX = 2000;   // per iteratie naar beneden scrollen
+const MAX_CARDS = 10;        // inspect only first 10 non-top cards for speed
 const UA =
   'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/118.0.0.0 Safari/537.36';
 
@@ -11,7 +10,7 @@ const clean = (s) => (s ?? '').replace(/\s+/g, ' ').trim() || null;
 
 let browser;
 
-/** Launch once & reuse (voorkomt OOM/slow starts) */
+/** Launch once and reuse (prevents OOM and long cold starts) */
 export async function ensureBrowser() {
   if (browser) return browser;
   const launchArgs = (process.env.PLAYWRIGHT_CHROMIUM_ARGS || '')
@@ -19,9 +18,7 @@ export async function ensureBrowser() {
     .filter(Boolean);
   browser = await chromium.launch({
     headless: true,
-    args: launchArgs.length
-      ? launchArgs
-      : ['--no-sandbox', '--disable-dev-shm-usage', '--single-process'],
+    args: launchArgs.length ? launchArgs : ['--no-sandbox', '--disable-dev-shm-usage', '--single-process'],
   });
   return browser;
 }
@@ -33,7 +30,7 @@ export async function closeBrowser() {
 
 export async function getFirstOrganicListing(listUrl, logger) {
   const b = await ensureBrowser();
-  const context = await b.newContext({ locale: 'nl-BE', userAgent: UA });
+  const context = await b.newContext({ locale: 'nl-BE', userAgent: UA, deviceScaleFactor: 1 });
   const page = await context.newPage();
 
   try {
@@ -43,109 +40,98 @@ export async function getFirstOrganicListing(listUrl, logger) {
     await dismissCookies(page);
 
     await page.waitForSelector('li.hz-Listing', { timeout: NAV_TIMEOUT });
+    // small scroll to trigger lazy content (but fast)
+    await page.evaluate(() => window.scrollBy(0, 700));
+    await page.waitForTimeout(150);
 
-    // we zoeken alleen tussen KAARTEN MET DATUM en ZONDER priority-badge
-    const nonAdCards = page.locator(
-      'li.hz-Listing:has(.hz-Listing-listingDate):not(:has(.hz-Listing-priority))'
-    );
+    // Only cards with date (normal listing), then we’ll skip priority ones
+    const candidates = page.locator('li.hz-Listing:has(.hz-Listing-listingDate)');
+    const total = Math.min(await candidates.count(), MAX_CARDS);
 
-    const t0 = Date.now();
-    let scanned = 0;
+    for (let i = 0; i < total; i++) {
+      const card = candidates.nth(i);
+      await card.waitFor({ state: 'attached', timeout: NAV_TIMEOUT });
 
-    while (Date.now() - t0 < SCAN_BUDGET_MS) {
-      // trigger lazy load
-      await page.evaluate((y) => window.scrollBy(0, y), CHUNK_SCROLL_PX);
-      await page.waitForTimeout(180);
+      // Hard skip: any priority badge/text
+      const hasPriority = (await safeCount(card, '.hz-Listing-priority')) > 0;
+      const text = ((await safeText(card, ':scope')) || '').toLowerCase();
+      const isAd =
+        hasPriority ||
+        text.includes('topadvertentie') ||
+        text.includes('topzoekertje') ||
+        text.includes('gesponsord') ||
+        /\badvertentie\b/.test(text);
+      if (isAd) continue;
 
-      const count = await nonAdCards.count();
-      for (let i = scanned; i < count; i++) {
-        const card = nonAdCards.nth(i);
+      // ---- Required: url + title
+      const href =
+        (await safeAttr(card, 'a[href*="/v/auto-s/"]', 'href')) ??
+        (await safeAttr(card, 'a[href]', 'href'));
+      const pageOrigin = await page.evaluate(() => globalThis.location.origin);
+      const url = href ? new URL(href, pageOrigin).href : null;
 
-        // extra tekst-fallback: sommige badges zijn alleen tekst
-        const lower = ((await safeText(card, ':scope')) || '').toLowerCase();
-        if (
-          lower.includes('topadvertentie') ||
-          lower.includes('topzoekertje') ||
-          lower.includes('gesponsord') ||
-          /\badvertentie\b/.test(lower)
-        ) {
-          continue;
-        }
+      const title =
+        (await safeText(card, '[data-testid="listing-title"], h3, h2, a[title]')) ||
+        (await safeText(card, 'a[title]'));
 
-        // ---- verplichte velden
-        const href =
-          (await safeAttr(card, 'a[href*="/v/auto-s/"]', 'href')) ??
-          (await safeAttr(card, 'a[href]', 'href'));
-        const pageOrigin = await page.evaluate(() => globalThis.location.origin);
-        const url = href ? new URL(href, pageOrigin).href : null;
+      if (!url || !title) continue;
 
-        const title =
-          (await safeText(card, '[data-testid="listing-title"], h3, h2, a[title]')) ||
-          (await safeText(card, 'a[title]'));
+      // ---- Optional fields
+      const priceRaw = await safeText(
+        card,
+        '[data-testid="price-box-price"], .hz-Listing-price, [class*="price"]'
+      );
+      const priceEUR = parsePriceEUR(priceRaw);
+      const date = await safeText(card, '.hz-Listing-listingDate');
 
-        if (!url || !title) continue;
+      // Icon attributes (year, mileage, fuel, transmission, body)
+      const attrTexts = await safeTexts(card, '.hz-Attribute.hz-Attribute--default');
+      const { year, mileageKm, fuel, transmission, body } = classifyAttributes(attrTexts);
 
-        // ---- optionele velden
-        const priceRaw = await safeText(
-          card,
-          '[data-testid="price-box-price"], .hz-Listing-price, [class*="price"]'
-        );
-        const priceEUR = parsePriceEUR(priceRaw);
-        const date = await safeText(card, '.hz-Listing-listingDate');
+      // Options
+      const optionsText = await safeText(card, '.hz-Listing-attribute-options');
+      const options = optionsText ? optionsText.split(',').map((t) => clean(t)).filter(Boolean) : null;
 
-        // icon-rij: jaar, km, brandstof, versnellingsbak, carrosserie
-        const attrTexts = await safeTexts(card, '.hz-Attribute.hz-Attribute--default');
-        const { year, mileageKm, fuel, transmission, body } = classifyAttributes(attrTexts);
+      // Seller info
+      const sellerName = await safeText(card, '.hz-Listing-seller-name');
+      const sellerCity = await safeText(card, '.hz-Listing-sellerLocation');
 
-        // opties
-        const optionsText = await safeText(card, '.hz-Listing-attribute-options');
-        const options = optionsText
-          ? optionsText.split(',').map((t) => clean(t)).filter(Boolean)
-          : null;
-
-        // verkoper + stad
-        const sellerName = await safeText(card, '.hz-Listing-seller-name');
-        const sellerCity = await safeText(card, '.hz-Listing-sellerLocation');
-
-        // adId uit url
-        let adId = null;
-        if (url) {
-          const m = url.match(/m(\d+)-/);
-          if (m) adId = m[1];
-          const m2 = url.match(/\/(\d{9,})/);
-          if (!adId && m2) adId = m2[1];
-        }
-
-        return {
-          url,
-          title: clean(title),
-          priceRaw: clean(priceRaw),
-          priceEUR,
-          date: clean(date),
-          adId,
-          year,
-          mileageKm,
-          fuel,
-          transmission,
-          body,
-          options,
-          sellerName: clean(sellerName),
-          sellerCity: clean(sellerCity),
-          scrapedAt: new Date().toISOString(),
-          listUrlUsed: listUrl,
-        };
+      // adId from URL
+      let adId = null;
+      if (url) {
+        const m = url.match(/m(\d+)-/);
+        if (m) adId = m[1];
+        const m2 = url.match(/\/(\d{9,})/);
+        if (!adId && m2) adId = m2[1];
       }
 
-      scanned = count;
+      return {
+        url,
+        title: clean(title),
+        priceRaw: clean(priceRaw),
+        priceEUR,
+        date: clean(date),
+        adId,
+        year,
+        mileageKm,
+        fuel,
+        transmission,
+        body,
+        options,
+        sellerName: clean(sellerName),
+        sellerCity: clean(sellerCity),
+        scrapedAt: new Date().toISOString(),
+        listUrlUsed: listUrl,
+      };
     }
 
-    throw new Error('Geen normale (niet-gesponsorde) kaart gevonden binnen het tijdsbudget.');
+    throw new Error('Geen normale (niet-gesponsorde) kaart gevonden in de eerste 10.');
   } finally {
-    await context.close(); // browser open houden voor volgende requests
+    await context.close(); // keep browser alive, only close context
   }
 }
 
-/* ---------------- helpers ---------------- */
+/* ---------- helpers: always fast & non-blocking ---------- */
 
 async function safeText(scope, selector) {
   try {
@@ -174,6 +160,9 @@ async function safeTexts(scope, selector) {
     return out;
   } catch { return []; }
 }
+async function safeCount(scope, selector) {
+  try { return await scope.locator(selector).count(); } catch { return 0; }
+}
 
 function parsePriceEUR(raw) {
   if (!raw) return null;
@@ -187,31 +176,16 @@ function parseKm(raw) {
   const digits = m[1].replace(/[^\d]/g, '');
   return digits ? parseInt(digits, 10) : null;
 }
-
 function classifyAttributes(items) {
-  const norm = (s) =>
-    (s || '').toString().normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase();
+  const norm = (s) => (s || '').toString().normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase();
+  const fuels = ['diesel','benzine','essence','petrol','elektrisch','electrique','electric','hybride','hybrid','plug-in hybride','plugin hybride','cng','lpg'];
+  const transmissions = ['automaat','automatic','automatisch','boite auto','boîte auto','boite automatique','boîte automatique','handgeschakeld','manueel','manuelle','boite manuelle','boîte manuelle','semi-automaat','semi automaat'];
+  const bodies = ['berline','sedan','hatchback','break','station','stationwagen','stationwagon','suv','coupe','coupé','cabri','cabrio','cabriolet','mpv','monovolume','pick-up','pickup','bestelwagen','bestel','coupé'];
 
-  const fuels = [
-    'diesel','benzine','essence','petrol','elektrisch','electrique','electric',
-    'hybride','hybrid','plug-in hybride','plugin hybride','cng','lpg'
-  ];
-  const transmissions = [
-    'automaat','automatic','automatisch','boite auto','boîte auto','boite automatique',
-    'boîte automatique','handgeschakeld','manueel','manuelle','boite manuelle',
-    'boîte manuelle','semi-automaat','semi automaat'
-  ];
-  const bodies = [
-    'berline','sedan','hatchback','break','station','stationwagen','stationwagon',
-    'suv','coupe','coupé','cabri','cabrio','cabriolet','mpv','monovolume',
-    'pick-up','pickup','bestelwagen','bestel','coupé'
-  ];
-
-  let year = null, mileageKm = null, fuel = null, transmission = null, body = null;
+  let year=null, mileageKm=null, fuel=null, transmission=null, body=null;
 
   for (const raw of items) {
     const t = norm(raw);
-
     const y = (raw.match(/(?:19|20)\d{2}/) || [])[0];
     if (!year && y && +y >= 1950 && +y <= 2035) year = y;
 
@@ -219,7 +193,6 @@ function classifyAttributes(items) {
       const km = parseKm(raw);
       if (km) mileageKm = km;
     }
-
     if (!fuel && fuels.some((k) => t.includes(k))) fuel = clean(raw);
     if (!transmission && transmissions.some((k) => t.includes(k))) transmission = clean(raw);
     if (!body && bodies.some((k) => t.includes(k))) body = clean(raw);
