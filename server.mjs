@@ -5,10 +5,12 @@ import { getFirstOrganicListing } from './scraper.mjs';
 const app = express();
 const logger = pino({ level: process.env.LOG_LEVEL || 'info' });
 
-const DEFAULT_URL = 'https://www.2dehands.be/l/auto-s/#f:10898|Language:all-languages|offeredSince:Vandaag|PriceCentsFrom:0|PriceCentsTo:1500000|sortBy:DATE|sortOrder:DECREASING';
+const DEFAULT_URL =
+  'https://www.2dehands.be/l/auto-s/#f:10898|Language:all-languages|offeredSince:Vandaag|PriceCentsFrom:0|PriceCentsTo:1500000|sortBy:DATE|sortOrder:DECREASING';
 
 app.get('/healthz', (_req, res) => res.json({ ok: true }));
 
+// Voor nu: enkel /latest (pakt de eerste NIET-gesponsorde kaart)
 app.get('/latest', async (req, res) => {
   const listUrl = (req.query.url && String(req.query.url)) || DEFAULT_URL;
   try {
