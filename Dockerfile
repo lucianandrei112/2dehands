@@ -1,17 +1,17 @@
-# Match package.json -> playwright 1.55.x and includes browsers
+# Matcht met package.json (playwright 1.55.0) en bevat browsers
 FROM mcr.microsoft.com/playwright:v1.55.0-jammy
 
 WORKDIR /app
 
-# install deps (no lockfile needed)
+# Eerst dependencies installeren (zonder lockfile kan dit ook)
 COPY package.json ./
 RUN npm install --omit=dev
 
+# Dan pas de rest kopiëren
 COPY . .
 
-# Chrome flags: no sandbox / shm workaround help on small containers
 ENV NODE_ENV=production
 ENV PORT=3000
-ENV PLAYWRIGHT_CHROMIUM_ARGS="--no-sandbox --disable-dev-shm-usage --single-process"
 
+# Browsers zijn al geïnstalleerd in de base image
 CMD ["node", "server.mjs"]
