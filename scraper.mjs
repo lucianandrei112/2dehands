@@ -19,96 +19,114 @@ export async function getFirstOrganicListing(listUrl, logger) {
 
     await dismissCookies(page);
 
-    // Wacht op 1e batch kaarten en trigger lazy content
+    // Let the page settle so priority badges can render
     await page.waitForSelector('li.hz-Listing', { timeout: DEFAULT_TIMEOUT });
-    await page.evaluate(() => window.scrollBy(0, 1000));
-    await page.waitForTimeout(300);
+    await page.waitForLoadState('networkidle', { timeout: DEFAULT_TIMEOUT }).catch(() => {});
+    await page.evaluate(() => window.scrollBy(0, 1200));
+    await page.waitForTimeout(350);
 
-    // SLEUTEL: eerste kaart MET datum EN ZONDER priority-badge
-    const card = page
-      .locator('li.hz-Listing:has(.hz-Listing-listingDate):not(:has(.hz-Listing-priority))')
-      .first();
+    // Candidates = only cards that HAVE a date (normal listing trait)
+    const candidates = page.locator('li.hz-Listing:has(.hz-Listing-listingDate)');
+    const total = await candidates.count();
 
-    // Wacht dat zo’n kaart effectief bestaat en renderbaar is
-    await card.waitFor({ state: 'attached', timeout: DEFAULT_TIMEOUT });
+    for (let i = 0; i < Math.min(total, 25); i++) {
+      const card = candidates.nth(i);
 
-    // helper voor optionele textcontent
-    const getText = async (loc) => {
+      // Re-check after a small settle to catch late-added badges
+      await card.waitFor({ state: 'attached', timeout: DEFAULT_TIMEOUT });
+      await page.waitForTimeout(120);
+
+      const hasPriority = (await card.locator('.hz-Listing-priority').count()) > 0;
+
+      // Text fallback (sometimes only text is present)
+      let txt = '';
       try {
-        const handle = card.locator(loc).first();
-        if (await handle.count() === 0) return null;
-        return clean(await handle.textContent({ timeout: SHORT_TIMEOUT }));
-      } catch {
-        return null;
+        txt = ((await card.textContent({ timeout: SHORT_TIMEOUT })) || '').toLowerCase();
+      } catch {}
+
+      const looksSponsored =
+        hasPriority ||
+        txt.includes('topadvertentie') ||
+        txt.includes('topzoekertje') ||
+        txt.includes('gesponsord') ||
+        /\badvertentie\b/.test(txt);
+
+      if (looksSponsored) continue; // skip Iveco-like topadvertenties
+
+      // --- extract fields (url & title required, rest optional) ---
+      const href =
+        (await card.locator('a[href*="/v/auto-s/"]').first().getAttribute('href').catch(() => null)) ??
+        (await card.locator('a[href]').first().getAttribute('href').catch(() => null));
+
+      const pageOrigin = await page.evaluate(() => globalThis.location.origin);
+      const url = href ? new URL(href, pageOrigin).href : null;
+
+      const title =
+        (await getText(card, '[data-testid="listing-title"], h3, h2, a[title]')) ||
+        (await getText(card, 'a[title]'));
+
+      const rawPrice = await getText(
+        card,
+        '[data-testid="price-box-price"], .hz-Listing-price, [class*="price"]'
+      );
+      const date = await getText(card, '.hz-Listing-listingDate');
+      const locationText = await getText(card, '[data-testid="location-name"], .hz-Listing-location');
+
+      // adId from URL
+      let adId = null;
+      if (url) {
+        const m = url.match(/m(\d+)-/);
+        if (m) adId = m[1];
+        const m2 = url.match(/\/(\d{9,})/);
+        if (!adId && m2) adId = m2[1];
       }
-    };
 
-    // URL
-    const href =
-      (await card.locator('a[href*="/v/auto-s/"]').first().getAttribute('href').catch(() => null)) ??
-      (await card.locator('a[href]').first().getAttribute('href').catch(() => null));
-    const pageOrigin = await page.evaluate(() => globalThis.location.origin);
-    const url = href ? new URL(href, pageOrigin).href : null;
+      if (!url || !title) continue; // if this card is incomplete, try next
 
-    // Titel (verplicht)
-    const title =
-      (await getText('[data-testid="listing-title"], h3, h2, a[title]')) ||
-      (await getText('a[title]'));
-
-    // Optioneel
-    const rawPrice = await getText(
-      '[data-testid="price-box-price"], .hz-Listing-price, [class*="price"]'
-    );
-    const date = await getText('.hz-Listing-listingDate');
-    const locationText = await getText('[data-testid="location-name"], .hz-Listing-location');
-
-    // adId
-    let adId = null;
-    if (url) {
-      const m = url.match(/m(\d+)-/);
-      if (m) adId = m[1];
-      const m2 = url.match(/\/(\d{9,})/);
-      if (!adId && m2) adId = m2[1];
+      return {
+        url,
+        title: clean(title),
+        price: rawPrice ? clean(rawPrice.replace(/[^\d.,]/g, '')) : null,
+        location: clean(locationText),
+        date: clean(date),
+        adId,
+        scrapedAt: new Date().toISOString(),
+        listUrlUsed: listUrl
+      };
     }
 
-    if (!url || !title) throw new Error('Kaart onvolledig (geen url of titel).');
-
-    return {
-      url,
-      title,
-      price: rawPrice ? rawPrice.replace(/[^\d.,]/g, '') : null,
-      location: locationText,
-      date,
-      adId,
-      scrapedAt: new Date().toISOString(),
-      listUrlUsed: listUrl
-    };
+    throw new Error('Geen normale (niet-gesponsorde) kaart met datum gevonden binnen de eerste 25 kaarten.');
   } finally {
     await context.close();
     await browser.close();
   }
 }
 
+// safe text getter (returns null if missing/slow)
+async function getText(card, selector) {
+  try {
+    const loc = card.locator(selector).first();
+    if ((await loc.count()) === 0) return null;
+    const txt = await loc.textContent({ timeout: SHORT_TIMEOUT });
+    return txt ? txt.trim() : null;
+  } catch {
+    return null;
+  }
+}
+
 async function dismissCookies(page) {
-  // 1) OneTrust id
   try {
     const btn = page.locator('#onetrust-accept-btn-handler');
-    if (await btn.isVisible({ timeout: 1500 })) {
-      await btn.click(); return;
-    }
+    if (await btn.isVisible({ timeout: 1500 })) { await btn.click(); return; }
   } catch {}
-  // 2) Doorgaan zonder te accepteren
+
   try {
     const noBtn = page.locator('button:has-text("Doorgaan zonder te accepteren")');
-    if (await noBtn.first().isVisible({ timeout: 1000 })) {
-      await noBtn.first().click(); return;
-    }
+    if (await noBtn.first().isVisible({ timeout: 1000 })) { await noBtn.first().click(); return; }
   } catch {}
-  // 3) Accepteren
+
   try {
     const acc = page.locator('button:has-text("Accepteren")');
-    if (await acc.first().isVisible({ timeout: 1000 })) {
-      await acc.first().click(); return;
-    }
+    if (await acc.first().isVisible({ timeout: 1000 })) { await acc.first().click(); return; }
   } catch {}
 }
