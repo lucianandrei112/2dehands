@@ -38,3 +38,8 @@ app.get('/latest', async (req, res) => {
 
 const port = process.env.PORT || 3000;
 app.listen(port, () => logger.info(`Listening on :${port}`));
+
+res.set('Cache-Control', 'no-store, no-cache, must-revalidate, max-age=0');
+res.set('Pragma', 'no-cache');
+res.set('Expires', '0');
+
