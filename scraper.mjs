@@ -4,7 +4,7 @@ const DEFAULT_TIMEOUT = 25000;
 const clean = (s) => (s ?? '').replace(/\s+/g, ' ').trim() || null;
 
 export async function getFirstOrganicListing(listUrl, logger) {
-  const browser = await chromium.launch(); // headless OK in Playwright base image
+  const browser = await chromium.launch(); // headless in Playwright base image
   const context = await browser.newContext({
     locale: 'nl-BE',
     userAgent:
@@ -16,99 +16,70 @@ export async function getFirstOrganicListing(listUrl, logger) {
     logger?.info({ listUrl }, 'Navigating to list URL');
     await page.goto(listUrl, { waitUntil: 'domcontentloaded', timeout: DEFAULT_TIMEOUT });
 
+    // Cookie banner wegklikken
     await dismissCookies(page);
 
+    // Zorg dat er listings zijn
     await page.waitForSelector('li.hz-Listing', { timeout: DEFAULT_TIMEOUT });
+
+    // Scroll klein stukje voor lazy content
     await page.evaluate(() => window.scrollBy(0, 800));
-    await page.waitForTimeout(400);
+    await page.waitForTimeout(300);
 
-    const result = await page.$$eval('li.hz-Listing', (cards) => {
-      // ————— helpers —————
-      const isTopOrAd = (card) => {
-        // 1) duidelijke priority badge (zoals in je screenshot)
-        if (card.querySelector('.hz-Listing-priority')) return true;
+    // >>> SLEUTEL: eerste kaart MET datum EN ZONDER priority-badge
+    const card = page
+      .locator('li.hz-Listing:has(.hz-Listing-listingDate):not(:has(.hz-Listing-priority))')
+      .first();
 
-        // 2) tekstfallbacks
-        const txt = (card.textContent || '').toLowerCase();
-        if (
-          txt.includes('topadvertentie') ||
-          txt.includes('topzoekertje') ||
-          txt.includes('gesponsord') ||
-          /\badvertentie\b/.test(txt)
-        ) return true;
+    // Wacht tot zo'n kaart effectief bestaat, anders error
+    await card.waitFor({ state: 'attached', timeout: DEFAULT_TIMEOUT });
 
-        return false;
-      };
+    // Extract met locators (geen $$eval/loops meer)
+    const href =
+      (await card.locator('a[href*="/v/auto-s/"]').first().getAttribute('href')) ??
+      (await card.locator('a[href]').first().getAttribute('href'));
+    const pageOrigin = await page.evaluate(() => globalThis.location.origin);
+    const url = href ? new URL(href, pageOrigin).href : null;
 
-      const extract = (card) => {
-        const pageOrigin =
-          (globalThis && globalThis.location && globalThis.location.origin) ||
-          (document && document.location && document.location.origin) ||
-          '';
+    const title =
+      (await card
+        .locator('[data-testid="listing-title"], h3, h2, a[title]')
+        .first()
+        .textContent()) || null;
 
-        // Link
-        const a =
-          card.querySelector('a[href*="/v/auto-s/"]') ||
-          card.querySelector('a[href*="/v/auto-s"], a[href*="/v/"]') ||
-          card.querySelector('a[href]');
-        const href = a ? a.getAttribute('href') : null;
-        const url = href ? new URL(href, pageOrigin).href : null;
+    const rawPrice =
+      (await card
+        .locator('[data-testid="price-box-price"], .hz-Listing-price, [class*="price"]')
+        .first()
+        .textContent()) || null;
 
-        // Titel
-        const titleEl =
-          card.querySelector('[data-testid="listing-title"], h3, h2') ||
-          card.querySelector('a[title]');
-        const title = titleEl ? titleEl.textContent.trim() : null;
+    const date =
+      (await card.locator('.hz-Listing-listingDate').first().textContent()) || null;
 
-        // Prijs
-        const priceEl =
-          card.querySelector('[data-testid="price-box-price"], .hz-Listing-price, [class*="price"]');
-        const price = priceEl ? priceEl.textContent.replace(/[^\d.,]/g, '').trim() : null;
+    const locText =
+      (await card
+        .locator('[data-testid="location-name"], .hz-Listing-location')
+        .first()
+        .textContent()) || null;
 
-        // Datum (vereist)
-        const dateEl = card.querySelector('.hz-Listing-listingDate');
-        const date = dateEl ? dateEl.textContent.trim() : null;
+    // adId uit URL
+    let adId = null;
+    if (url) {
+      const m = url.match(/m(\d+)-/);
+      if (m) adId = m[1];
+      const m2 = url.match(/\/(\d{9,})/);
+      if (!adId && m2) adId = m2[1];
+    }
 
-        // Locatie
-        const locEl = card.querySelector('[data-testid="location-name"], .hz-Listing-location');
-        const loc = locEl ? locEl.textContent.trim() : null;
-
-        // adId
-        let adId = null;
-        if (url) {
-          const m = url.match(/m(\d+)-/);
-          if (m) adId = m[1];
-          const m2 = url.match(/\/(\d{9,})/);
-          if (!adId && m2) adId = m2[1];
-        }
-
-        return { url, title, price, loc, date, adId };
-      };
-
-      // ————— main —————
-      for (const card of cards) {
-        // Vereiste 1: er moet een datum-element zijn (normale zoekertje)
-        const hasDate = !!card.querySelector('.hz-Listing-listingDate');
-        if (!hasDate) continue;
-
-        // Vereiste 2: GEEN priority/Topadvertentie/Advertentie
-        if (isTopOrAd(card)) continue;
-
-        // Minimale validatie
-        const data = extract(card);
-        if (data?.url && data?.title) return data;
-      }
-      return null;
-    });
-
-    if (!result) throw new Error('Geen normale (niet-gesponsorde) kaart met datum gevonden.');
+    if (!url || !title) throw new Error('Kaart onvolledig (geen url of titel).');
 
     return {
-      ...result,
-      title: clean(result.title),
-      price: clean(result.price),
-      location: clean(result.loc),
-      date: clean(result.date),
+      url,
+      title: clean(title),
+      price: clean(rawPrice ? rawPrice.replace(/[^\d.,]/g, '') : null),
+      location: clean(locText),
+      date: clean(date),
+      adId,
       scrapedAt: new Date().toISOString(),
       listUrlUsed: listUrl
     };
@@ -119,22 +90,28 @@ export async function getFirstOrganicListing(listUrl, logger) {
 }
 
 async function dismissCookies(page) {
+  // 1) standaard OneTrust id
   try {
     const btn = page.locator('#onetrust-accept-btn-handler');
-    if (await btn.isVisible({ timeout: 2500 })) {
-      await btn.click(); return;
+    if (await btn.isVisible({ timeout: 2000 })) {
+      await btn.click();
+      return;
     }
   } catch {}
+  // 2) “Doorgaan zonder te accepteren”
   try {
     const noBtn = page.locator('button:has-text("Doorgaan zonder te accepteren")');
-    if (await noBtn.first().isVisible({ timeout: 2000 })) {
-      await noBtn.first().click(); return;
+    if (await noBtn.first().isVisible({ timeout: 1500 })) {
+      await noBtn.first().click();
+      return;
     }
   } catch {}
+  // 3) “Accepteren”
   try {
     const acc = page.locator('button:has-text("Accepteren")');
-    if (await acc.first().isVisible({ timeout: 2000 })) {
-      await acc.first().click(); return;
+    if (await acc.first().isVisible({ timeout: 1500 })) {
+      await acc.first().click();
+      return;
     }
   } catch {}
 }
