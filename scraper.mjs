@@ -6,26 +6,12 @@ const MAX_CARDS = Number(process.env.MAX_CARDS || 25);
 const SCROLL_BUDGET_MS = Number(process.env.SCROLL_BUDGET_MS || 7000);
 const SCROLL_STEP_PX = Number(process.env.SCROLL_STEP_PX || 2000);
 
-// NIEUW: Meerdere user agents om detectie te vermijden
-const USER_AGENTS = [
-  'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/118.0.0.0 Safari/537.36',
-  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/118.0.0.0 Safari/537.36',
-  'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/118.0.0.0 Safari/537.36',
-  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/117.0.0.0 Safari/537.36',
-  'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/117.0.0.0 Safari/537.36'
-];
+const UA =
+  'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/118.0.0.0 Safari/537.36';
 
 const clean = (s) => (s ?? '').replace(/\s+/g, ' ').trim() || null;
 
 let browser;
-
-// NIEUW: Track requests voor browser refresh
-let requestCount = 0;
-const MAX_REQUESTS_BEFORE_REFRESH = 30; // Refresh browser elke 30 requests
-
-// NIEUW: Track laatste resultaten om rate limiting te detecteren
-let lastFoundAdId = null;
-let sameResultCount = 0;
 
 /* ------------ Browser lifecycle (reliable) ------------ */
 
@@ -33,35 +19,17 @@ async function launchBrowser() {
   const launchArgs = (process.env.PLAYWRIGHT_CHROMIUM_ARGS || '')
     .split(' ')
     .filter(Boolean);
-  
-  // NIEUW: Extra anti-detectie argumenten toegevoegd
-  const defaultArgs = [
-    '--no-sandbox', 
-    '--disable-dev-shm-usage', 
-    '--single-process', 
-    '--no-zygote', 
-    '--disable-gpu',
-    '--disable-blink-features=AutomationControlled', // NIEUW: Verberg automation
-    '--disable-features=IsolateOrigins,site-per-process' // NIEUW
-  ];
-  
   browser = await chromium.launch({
     headless: true,
-    args: launchArgs.length ? launchArgs : defaultArgs,
+    args: launchArgs.length
+      ? launchArgs
+      : ['--no-sandbox', '--disable-dev-shm-usage', '--single-process', '--no-zygote', '--disable-gpu'],
   });
   return browser;
 }
 
 /** Launch once & reuse. Relaunch when disconnected/crashed. */
 export async function ensureBrowser() {
-  // NIEUW: Forceer browser refresh na X requests
-  if (requestCount >= MAX_REQUESTS_BEFORE_REFRESH) {
-    console.log(`[INFO] Refreshing browser after ${requestCount} requests...`);
-    await closeBrowser();
-    requestCount = 0;
-    await new Promise(r => setTimeout(r, 3000)); // Wacht 3 seconden
-  }
-  
   if (!browser || (typeof browser.isConnected === 'function' && !browser.isConnected())) {
     try { if (browser) await browser.close(); } catch {}
     await launchBrowser();
@@ -77,33 +45,8 @@ export async function closeBrowser() {
 /* ------------ Main scrape with 1 automatic retry ------------ */
 
 export async function getFirstOrganicListing(listUrl, logger) {
-  requestCount++; // NIEUW: Tel requests
-  
   try {
-    const result = await doScrape(listUrl, logger);
-    
-    // NIEUW: Check voor rate limiting
-    if (result && result.adId) {
-      if (result.adId === lastFoundAdId) {
-        sameResultCount++;
-        console.log(`[WARNING] Same ad found ${sameResultCount} times: ${result.adId}`);
-        
-        // Als we 5x dezelfde krijgen, forceer browser refresh
-        if (sameResultCount >= 5) {
-          console.log('[INFO] Possible rate limiting detected, forcing browser refresh...');
-          await closeBrowser();
-          requestCount = 0;
-          sameResultCount = 0;
-          await new Promise(r => setTimeout(r, 10000)); // Wacht 10 seconden
-        }
-      } else {
-        sameResultCount = 0;
-        lastFoundAdId = result.adId;
-        console.log(`[INFO] New ad found: ${result.adId}`);
-      }
-    }
-    
-    return result;
+    return await doScrape(listUrl, logger);
   } catch (err) {
     const msg = String(err?.message || err);
     // Als de browser/target gesloten is → herstart en nog 1 poging
@@ -121,39 +64,11 @@ async function doScrape(listUrl, logger) {
   let context, page;
 
   try {
-    // NIEUW: Random user agent selecteren
-    const randomUA = USER_AGENTS[Math.floor(Math.random() * USER_AGENTS.length)];
-    
-    // NIEUW: Kleine random delay voor menselijk gedrag
-    await new Promise(r => setTimeout(r, 500 + Math.random() * 1500));
-    
-    // NIEUW: Gebruik random UA en voeg timestamp toe aan URL
-    context = await b.newContext({ 
-      locale: 'nl-BE', 
-      userAgent: randomUA, // NIEUW: Random UA
-      deviceScaleFactor: 1,
-      // NIEUW: Extra headers
-      extraHTTPHeaders: {
-        'Accept-Language': 'nl-BE,nl;q=0.9,en;q=0.8',
-        'Cache-Control': 'no-cache',
-        'Pragma': 'no-cache'
-      }
-    });
-    
+    context = await b.newContext({ locale: 'nl-BE', userAgent: UA, deviceScaleFactor: 1 });
     page = await context.newPage();
-    
-    // NIEUW: Voeg anti-detectie script toe
-    await page.addInitScript(() => {
-      Object.defineProperty(navigator, 'webdriver', {
-        get: () => undefined
-      });
-    });
 
-    // NIEUW: Voeg timestamp aan URL voor cache busting
-    const urlWithTimestamp = listUrl + (listUrl.includes('?') ? '&' : '?') + '_t=' + Date.now();
-    
-    logger?.debug?.({ listUrl: urlWithTimestamp }, 'goto');
-    await page.goto(urlWithTimestamp, { waitUntil: 'domcontentloaded', timeout: NAV_TIMEOUT });
+    logger?.debug?.({ listUrl }, 'goto');
+    await page.goto(listUrl, { waitUntil: 'domcontentloaded', timeout: NAV_TIMEOUT });
 
     await dismissCookies(page);
     await page.waitForSelector('li.hz-Listing', { timeout: NAV_TIMEOUT });
@@ -178,15 +93,12 @@ async function doScrape(listUrl, logger) {
     }
 
     const total = Math.min(await datedCards.count(), MAX_CARDS);
-    
-    // NIEUW: Log voor debugging
-    console.log(`[SCRAPE] Found ${total} dated cards`);
 
     for (let i = 0; i < total; i++) {
       const card = datedCards.nth(i);
       await card.waitFor({ state: 'attached', timeout: NAV_TIMEOUT });
 
-      // Skip topadvertenties/gesponsord (badge + tekst) - JOUW ORIGINELE LOGICA
+      // Skip topadvertenties/gesponsord (badge + tekst)
       const hasPriority = (await safeCount(card, '.hz-Listing-priority')) > 0;
       const text = ((await card.textContent().catch(() => null)) || '').toLowerCase();
       const isAd =
@@ -195,13 +107,9 @@ async function doScrape(listUrl, logger) {
         text.includes('topzoekertje') ||
         text.includes('gesponsord') ||
         /\badvertentie\b/.test(text);
-      
-      if (isAd) {
-        console.log(`[SCRAPE] Skipping ad at position ${i}`); // NIEUW: Debug log
-        continue;
-      }
+      if (isAd) continue;
 
-      // ---- Verplicht: url + titel - JOUW ORIGINELE CODE
+      // ---- Verplicht: url + titel
       const href =
         (await safeAttr(card, 'a[href*="/v/auto-s/"]', 'href')) ??
         (await safeAttr(card, 'a[href]', 'href'));
@@ -214,7 +122,7 @@ async function doScrape(listUrl, logger) {
 
       if (!url || !title) continue;
 
-      // ---- Optioneel (best-effort) - JOUW ORIGINELE CODE
+      // ---- Optioneel (best-effort)
       const priceRaw = await safeText(
         card,
         '[data-testid="price-box-price"], .hz-Listing-price, [class*="price"]'
@@ -242,9 +150,6 @@ async function doScrape(listUrl, logger) {
         const m2 = url.match(/\/(\d{9,})/);
         if (!adId && m2) adId = m2[1];
       }
-      
-      // NIEUW: Log gevonden auto
-      console.log(`[FOUND] ${title.substring(0, 40)}... (ID: ${adId})`);
 
       return {
         url,
@@ -274,7 +179,7 @@ async function doScrape(listUrl, logger) {
   }
 }
 
-/* ---------- helpers - EXACT JOUW ORIGINELE CODE ---------- */
+/* ---------- helpers ---------- */
 
 async function safeText(scope, selector) {
   try {
@@ -324,7 +229,7 @@ function classifyAttributes(items) {
   const norm = (s) => (s || '').toString().normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase();
   const fuels = ['diesel','benzine','essence','petrol','elektrisch','electrique','electric','hybride','hybrid','plug-in hybride','plugin hybride','cng','lpg'];
   const transmissions = ['automaat','automatic','automatisch','boite auto','boîte auto','boite automatique','boîte automatique','handgeschakeld','manueel','manuelle','boite manuelle','boîte manuelle','semi-automaat','semi automaat'];
-  const bodies = ['berline','sedan','hatchback','break','station','stationwagen','stationwagon','suv','coupe','coupé','cabri','cabrio','cabriolet','mpv','monovolume','pick-up','pickup','bestelwagen','bestel','coupé'];
+  const bodies = ['berline','sedan','hatchback','break','station','stationwagen','stationwagon','suv','coupe','coupé','cabri','cabrio','cabriolet','mpv','monovolume','pick-up','pickup','bestelwagen','bestel','coupé'];
 
   let year=null, mileageKm=null, fuel=null, transmission=null, body=null;
 
