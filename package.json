@@ -1,0 +1,16 @@
+{
+  "name": "2dehands-autoscraper",
+  "version": "1.0.0",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "start": "node server.mjs",
+    "dev": "NODE_ENV=development node server.mjs",
+    "install-playwright": "npx playwright install --with-deps"
+  },
+  "dependencies": {
+    "express": "^4.19.2",
+    "playwright": "^1.46.0",
+    "pino": "^9.0.0"
+  }
+}
