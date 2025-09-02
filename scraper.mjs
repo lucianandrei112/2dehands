@@ -9,13 +9,12 @@ const SCROLL_STEP_PX = Number(process.env.SCROLL_STEP_PX || 2000);
 const UA =
   'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/118.0.0.0 Safari/537.36';
 
-const AD_TEXT_RE = /\b(topadvertentie|topzoekertje|gesponsord|gesponsorde|sponsored|publicit[eé]|annonce sponsoris[ée]e?|annonce publicitaire|mise en avant|mise en évidence)\b/i;
-
 const clean = (s) => (s ?? '').replace(/\s+/g, ' ').trim() || null;
 
 let browser;
 
 /* ------------ Browser lifecycle (reliable) ------------ */
+
 async function launchBrowser() {
   const launchArgs = (process.env.PLAYWRIGHT_CHROMIUM_ARGS || '')
     .split(' ')
@@ -29,6 +28,7 @@ async function launchBrowser() {
   return browser;
 }
 
+/** Launch once & reuse. Relaunch when disconnected/crashed. */
 export async function ensureBrowser() {
   if (!browser || (typeof browser.isConnected === 'function' && !browser.isConnected())) {
     try { if (browser) await browser.close(); } catch {}
@@ -43,11 +43,13 @@ export async function closeBrowser() {
 }
 
 /* ------------ Main scrape with 1 automatic retry ------------ */
+
 export async function getFirstOrganicListing(listUrl, logger) {
   try {
     return await doScrape(listUrl, logger);
   } catch (err) {
     const msg = String(err?.message || err);
+    // Als de browser/target gesloten is → herstart en nog 1 poging
     if (/Target .* (closed|crash)|has been closed|browser has been closed/i.test(msg)) {
       await closeBrowser();
       await ensureBrowser();
@@ -62,71 +64,50 @@ async function doScrape(listUrl, logger) {
   let context, page;
 
   try {
-    // nieuwe context met no-cache headers
-    context = await b.newContext({
-      locale: 'nl-BE',
-      userAgent: UA,
-      deviceScaleFactor: 1,
-      extraHTTPHeaders: {
-        'Cache-Control': 'no-cache, no-store, must-revalidate',
-        'Pragma': 'no-cache',
-        'Expires': '0',
-      },
-    });
-
-    // client state leeg
-    await context.addInitScript(() => {
-      try { localStorage.clear(); } catch {}
-      try { sessionStorage.clear(); } catch {}
-    });
-
-    // zware assets blokkeren (sneller/stabieler)
-    await context.route('**/*', (route) => {
-      const rt = route.request().resourceType();
-      if (rt === 'image' || rt === 'font' || rt === 'media') return route.abort();
-      return route.continue();
-    });
-
+    context = await b.newContext({ locale: 'nl-BE', userAgent: UA, deviceScaleFactor: 1 });
     page = await context.newPage();
 
-    const urlWithTs = addCacheBuster(listUrl);
-    logger?.debug?.({ urlWithTs }, 'goto');
-    await page.goto(urlWithTs, { waitUntil: 'domcontentloaded', timeout: NAV_TIMEOUT });
+    logger?.debug?.({ listUrl }, 'goto');
+    await page.goto(listUrl, { waitUntil: 'domcontentloaded', timeout: NAV_TIMEOUT });
 
     await dismissCookies(page);
     await page.waitForSelector('li.hz-Listing', { timeout: NAV_TIMEOUT });
 
-    // echt bovenaan starten + mini nudge voor lazy render
-    await page.evaluate(() => window.scrollTo(0, 0));
-    await page.waitForTimeout(120);
-    await page.evaluate(() => window.scrollBy(0, 300));
-    await page.waitForTimeout(100);
+    // kleine scroll om lazy content te triggeren
+    await page.evaluate(() => window.scrollBy(0, 700));
+    await page.waitForTimeout(150);
 
-    // kaarten MET datum en ZONDER priority-badge
-    const nonBadgeCards = page.locator(
-      'li.hz-Listing:has(.hz-Listing-listingDate):not(:has(.hz-Listing-priority))'
-    );
+    // We willen kaarten MET datum
+    const datedCards = page.locator('li.hz-Listing:has(.hz-Listing-listingDate)');
 
-    // indien nodig kort scrollen tot er eentje zichtbaar is of budget op is
+    // Scroll door tot we minstens MAX_CARDS dated cards zien of het budget op is
     const t0 = Date.now();
-    while ((await nonBadgeCards.count()) === 0 && Date.now() - t0 < SCROLL_BUDGET_MS) {
+    let lastCount = 0;
+    while (Date.now() - t0 < SCROLL_BUDGET_MS) {
+      const count = await datedCards.count();
+      if (count >= MAX_CARDS) break;
+      if (count === lastCount) await page.waitForTimeout(150);
       await page.evaluate((y) => window.scrollBy(0, y), SCROLL_STEP_PX);
-      await page.waitForTimeout(180);
+      await page.waitForTimeout(220);
+      lastCount = count;
     }
 
-    const total = Math.min(await nonBadgeCards.count(), MAX_CARDS);
-    if (total === 0) throw new Error(`Geen normale (niet-gesponsorde) kaart gevonden.`);
+    const total = Math.min(await datedCards.count(), MAX_CARDS);
 
     for (let i = 0; i < total; i++) {
-      const card = nonBadgeCards.nth(i);
+      const card = datedCards.nth(i);
       await card.waitFor({ state: 'attached', timeout: NAV_TIMEOUT });
 
-      // extra anti-ad: check de meta-zone/kaarttekst
-      const metaText =
-        (await safeText(card, '.hz-Listing-meta')) ??
-        (await card.textContent().catch(() => '')) ??
-        '';
-      if (AD_TEXT_RE.test(metaText)) continue;
+      // Skip topadvertenties/gesponsord (badge + tekst)
+      const hasPriority = (await safeCount(card, '.hz-Listing-priority')) > 0;
+      const text = ((await card.textContent().catch(() => null)) || '').toLowerCase();
+      const isAd =
+        hasPriority ||
+        text.includes('topadvertentie') ||
+        text.includes('topzoekertje') ||
+        text.includes('gesponsord') ||
+        /\badvertentie\b/.test(text);
+      if (isAd) continue;
 
       // ---- Verplicht: url + titel
       const href =
@@ -149,14 +130,15 @@ async function doScrape(listUrl, logger) {
       const priceEUR = parsePriceEUR(priceRaw);
       const date = await safeText(card, '.hz-Listing-listingDate');
 
-      // Icon-rij
+      // Icon-rij: jaar/km/brandstof/transmissie/carrosserie
       const attrTexts = await safeTexts(card, '.hz-Attribute.hz-Attribute--default');
       const { year, mileageKm, fuel, transmission, body } = classifyAttributes(attrTexts);
 
-      // Opties / verkoper
+      // Opties
       const optionsText = await safeText(card, '.hz-Listing-attribute-options');
       const options = optionsText ? optionsText.split(',').map((t) => clean(t)).filter(Boolean) : null;
 
+      // Verkoper + stad
       const sellerName = await safeText(card, '.hz-Listing-seller-name');
       const sellerCity = await safeText(card, '.hz-Listing-sellerLocation');
 
@@ -185,7 +167,7 @@ async function doScrape(listUrl, logger) {
         sellerName: clean(sellerName),
         sellerCity: clean(sellerCity),
         scrapedAt: new Date().toISOString(),
-        listUrlUsed: listUrl,  // zonder _ts teruggeven
+        listUrlUsed: listUrl,
       };
     }
 
@@ -193,21 +175,11 @@ async function doScrape(listUrl, logger) {
   } finally {
     try { if (page) await page.close(); } catch {}
     try { if (context) await context.close(); } catch {}
+    // browser blijft open voor volgende request
   }
 }
 
 /* ---------- helpers ---------- */
-
-function addCacheBuster(u) {
-  const ts = `_ts=${Date.now()}_${Math.random().toString(36).slice(2)}`;
-  const hashIdx = u.indexOf('#');
-  if (hashIdx === -1) {
-    return u + (u.includes('?') ? '&' : '?') + ts;
-  }
-  const base = u.slice(0, hashIdx);
-  const hash = u.slice(hashIdx); // inclusief '#'
-  return base + (base.includes('?') ? '&' : '?') + ts + hash;
-}
 
 async function safeText(scope, selector) {
   try {
