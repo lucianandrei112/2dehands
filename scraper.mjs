@@ -1,6 +1,6 @@
 import { chromium } from 'playwright';
 
-const NAV_TIMEOUT = 10000;                        // snel falen i.p.v. hangen
+const NAV_TIMEOUT = 10000;
 const SHORT_TIMEOUT = 600;
 const MAX_CARDS = Number(process.env.MAX_CARDS || 25);
 const SCROLL_BUDGET_MS = Number(process.env.SCROLL_BUDGET_MS || 7000);
@@ -49,7 +49,6 @@ export async function getFirstOrganicListing(listUrl, logger) {
     return await doScrape(listUrl, logger);
   } catch (err) {
     const msg = String(err?.message || err);
-    // Als de browser/target gesloten is → herstart en nog 1 poging
     if (/Target .* (closed|crash)|has been closed|browser has been closed/i.test(msg)) {
       await closeBrowser();
       await ensureBrowser();
@@ -67,115 +66,111 @@ async function doScrape(listUrl, logger) {
     context = await b.newContext({ locale: 'nl-BE', userAgent: UA, deviceScaleFactor: 1 });
     page = await context.newPage();
 
-    logger?.debug?.({ listUrl }, 'goto');
-    await page.goto(listUrl, { waitUntil: 'domcontentloaded', timeout: NAV_TIMEOUT });
+    // Altijd verse lijst laden
+    const urlWithTs = listUrl + (listUrl.includes('?') ? '&' : '?') + `_ts=${Date.now()}`;
+
+    logger?.debug?.({ urlWithTs }, 'goto');
+    await page.goto(urlWithTs, { waitUntil: 'domcontentloaded', timeout: NAV_TIMEOUT });
 
     await dismissCookies(page);
     await page.waitForSelector('li.hz-Listing', { timeout: NAV_TIMEOUT });
 
-    // kleine scroll om lazy content te triggeren
-    await page.evaluate(() => window.scrollBy(0, 700));
-    await page.waitForTimeout(150);
+    // Zorg dat we écht bovenaan starten
+    await page.evaluate(() => window.scrollTo(0, 0));
+    await page.waitForTimeout(120);
 
-    // We willen kaarten MET datum
-    const datedCards = page.locator('li.hz-Listing:has(.hz-Listing-listingDate)');
+    // Kleine nudge om lazy render te triggeren
+    await page.evaluate(() => window.scrollBy(0, 300));
+    await page.waitForTimeout(120);
 
-    // Scroll door tot we minstens MAX_CARDS dated cards zien of het budget op is
+    // ===== BELANGRIJK: selecteer direct NIET-AD kaarten =====
+    const nonAdCards = page.locator(
+      'li.hz-Listing:has(.hz-Listing-listingDate):not(:has(.hz-Listing-priority))'
+    );
+
+    // Scroll net zolang tot we er minstens eentje zien of budget op is
     const t0 = Date.now();
     let lastCount = 0;
-    while (Date.now() - t0 < SCROLL_BUDGET_MS) {
-      const count = await datedCards.count();
-      if (count >= MAX_CARDS) break;
-      if (count === lastCount) await page.waitForTimeout(150);
+    while (Date.now() - t0 < SCROLL_BUDGET_MS && (await nonAdCards.count()) === 0) {
+      const before = await nonAdCards.count();
       await page.evaluate((y) => window.scrollBy(0, y), SCROLL_STEP_PX);
-      await page.waitForTimeout(220);
-      lastCount = count;
+      await page.waitForTimeout(200);
+      const after = await nonAdCards.count();
+      if (after >= MAX_CARDS) break;
+      if (after === before && after === lastCount) await page.waitForTimeout(120);
+      lastCount = after;
     }
 
-    const total = Math.min(await datedCards.count(), MAX_CARDS);
+    const total = Math.min(await nonAdCards.count(), MAX_CARDS);
+    if (total === 0) throw new Error('Geen normale (niet-gesponsorde) kaart gevonden.');
 
-    for (let i = 0; i < total; i++) {
-      const card = datedCards.nth(i);
-      await card.waitFor({ state: 'attached', timeout: NAV_TIMEOUT });
+    // Pak de allereerste NIET-AD kaart (deterministisch)
+    const card = nonAdCards.first();
+    await card.waitFor({ state: 'attached', timeout: NAV_TIMEOUT });
 
-      // Skip topadvertenties/gesponsord (badge + tekst)
-      const hasPriority = (await safeCount(card, '.hz-Listing-priority')) > 0;
-      const text = ((await card.textContent().catch(() => null)) || '').toLowerCase();
-      const isAd =
-        hasPriority ||
-        text.includes('topadvertentie') ||
-        text.includes('topzoekertje') ||
-        text.includes('gesponsord') ||
-        /\badvertentie\b/.test(text);
-      if (isAd) continue;
+    // ---- Verplicht: url + titel
+    const href =
+      (await safeAttr(card, 'a[href*="/v/auto-s/"]', 'href')) ??
+      (await safeAttr(card, 'a[href]', 'href'));
+    const pageOrigin = await page.evaluate(() => globalThis.location.origin);
+    const url = href ? new URL(href, pageOrigin).href : null;
 
-      // ---- Verplicht: url + titel
-      const href =
-        (await safeAttr(card, 'a[href*="/v/auto-s/"]', 'href')) ??
-        (await safeAttr(card, 'a[href]', 'href'));
-      const pageOrigin = await page.evaluate(() => globalThis.location.origin);
-      const url = href ? new URL(href, pageOrigin).href : null;
+    const title =
+      (await safeText(card, '[data-testid="listing-title"], h3, h2, a[title]')) ||
+      (await safeText(card, 'a[title]'));
 
-      const title =
-        (await safeText(card, '[data-testid="listing-title"], h3, h2, a[title]')) ||
-        (await safeText(card, 'a[title]'));
+    if (!url || !title) throw new Error('Kaart onvolledig (geen url/titel).');
 
-      if (!url || !title) continue;
+    // ---- Optioneel (best-effort)
+    const priceRaw = await safeText(
+      card,
+      '[data-testid="price-box-price"], .hz-Listing-price, [class*="price"]'
+    );
+    const priceEUR = parsePriceEUR(priceRaw);
+    const date = await safeText(card, '.hz-Listing-listingDate');
 
-      // ---- Optioneel (best-effort)
-      const priceRaw = await safeText(
-        card,
-        '[data-testid="price-box-price"], .hz-Listing-price, [class*="price"]'
-      );
-      const priceEUR = parsePriceEUR(priceRaw);
-      const date = await safeText(card, '.hz-Listing-listingDate');
+    // Icon-rij: jaar/km/brandstof/transmissie/carrosserie
+    const attrTexts = await safeTexts(card, '.hz-Attribute.hz-Attribute--default');
+    const { year, mileageKm, fuel, transmission, body } = classifyAttributes(attrTexts);
 
-      // Icon-rij: jaar/km/brandstof/transmissie/carrosserie
-      const attrTexts = await safeTexts(card, '.hz-Attribute.hz-Attribute--default');
-      const { year, mileageKm, fuel, transmission, body } = classifyAttributes(attrTexts);
+    // Opties
+    const optionsText = await safeText(card, '.hz-Listing-attribute-options');
+    const options = optionsText ? optionsText.split(',').map((t) => clean(t)).filter(Boolean) : null;
 
-      // Opties
-      const optionsText = await safeText(card, '.hz-Listing-attribute-options');
-      const options = optionsText ? optionsText.split(',').map((t) => clean(t)).filter(Boolean) : null;
+    // Verkoper + stad
+    const sellerName = await safeText(card, '.hz-Listing-seller-name');
+    const sellerCity = await safeText(card, '.hz-Listing-sellerLocation');
 
-      // Verkoper + stad
-      const sellerName = await safeText(card, '.hz-Listing-seller-name');
-      const sellerCity = await safeText(card, '.hz-Listing-sellerLocation');
-
-      // adId uit URL
-      let adId = null;
-      if (url) {
-        const m = url.match(/m(\d+)-/);
-        if (m) adId = m[1];
-        const m2 = url.match(/\/(\d{9,})/);
-        if (!adId && m2) adId = m2[1];
-      }
-
-      return {
-        url,
-        title: clean(title),
-        priceRaw: clean(priceRaw),
-        priceEUR,
-        date: clean(date),
-        adId,
-        year,
-        mileageKm,
-        fuel,
-        transmission,
-        body,
-        options,
-        sellerName: clean(sellerName),
-        sellerCity: clean(sellerCity),
-        scrapedAt: new Date().toISOString(),
-        listUrlUsed: listUrl,
-      };
+    // adId uit URL
+    let adId = null;
+    if (url) {
+      const m = url.match(/m(\d+)-/);
+      if (m) adId = m[1];
+      const m2 = url.match(/\/(\d{9,})/);
+      if (!adId && m2) adId = m2[1];
     }
 
-    throw new Error(`Geen normale (niet-gesponsorde) kaart gevonden in de eerste ${total || 0}.`);
+    return {
+      url,
+      title: clean(title),
+      priceRaw: clean(priceRaw),
+      priceEUR,
+      date: clean(date),
+      adId,
+      year,
+      mileageKm,
+      fuel,
+      transmission,
+      body,
+      options,
+      sellerName: clean(sellerName),
+      sellerCity: clean(sellerCity),
+      scrapedAt: new Date().toISOString(),
+      listUrlUsed: listUrl,
+    };
   } finally {
     try { if (page) await page.close(); } catch {}
     try { if (context) await context.close(); } catch {}
-    // browser blijft open voor volgende request
   }
 }
 
@@ -208,9 +203,6 @@ async function safeTexts(scope, selector) {
     return out;
   } catch { return []; }
 }
-async function safeCount(scope, selector) {
-  try { return await scope.locator(selector).count(); } catch { return 0; }
-}
 
 function parsePriceEUR(raw) {
   if (!raw) return null;
@@ -228,7 +220,7 @@ function parseKm(raw) {
 function classifyAttributes(items) {
   const norm = (s) => (s || '').toString().normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase();
   const fuels = ['diesel','benzine','essence','petrol','elektrisch','electrique','electric','hybride','hybrid','plug-in hybride','plugin hybride','cng','lpg'];
-  const transmissions = ['automaat','automatic','automatisch','boite auto','boîte auto','boite automatique','boîte automatique','handgeschakeld','manueel','manuelle','boite manuelle','boîte manuelle','semi-automaat','semi automaat'];
+  const transmissions = ['automaat','automatic','automatisch','boite auto','boîte auto','boite automatique','boîte automatische','handgeschakeld','manueel','manuelle','boite manuelle','boîte manuelle','semi-automaat','semi automaat'];
   const bodies = ['berline','sedan','hatchback','break','station','stationwagen','stationwagon','suv','coupe','coupé','cabri','cabrio','cabriolet','mpv','monovolume','pick-up','pickup','bestelwagen','bestel','coupé'];
 
   let year=null, mileageKm=null, fuel=null, transmission=null, body=null;
