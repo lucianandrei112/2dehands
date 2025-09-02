@@ -1,8 +1,11 @@
 import { chromium } from 'playwright';
 
-const NAV_TIMEOUT = 10000;   // keep tight so we fail fast instead of hanging
+const NAV_TIMEOUT = 10000;                        // snel falen i.p.v. hangen
 const SHORT_TIMEOUT = 600;
-const MAX_CARDS = 10;        // inspect only first 10 non-top cards for speed
+const MAX_CARDS = Number(process.env.MAX_CARDS || 25); // <-- zet via Railway env
+const SCROLL_BUDGET_MS = Number(process.env.SCROLL_BUDGET_MS || 7000);
+const SCROLL_STEP_PX = Number(process.env.SCROLL_STEP_PX || 2000);
+
 const UA =
   'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/118.0.0.0 Safari/537.36';
 
@@ -10,7 +13,7 @@ const clean = (s) => (s ?? '').replace(/\s+/g, ' ').trim() || null;
 
 let browser;
 
-/** Launch once and reuse (prevents OOM and long cold starts) */
+/** Launch once & reuse (sneller/stabieler op Railway) */
 export async function ensureBrowser() {
   if (browser) return browser;
   const launchArgs = (process.env.PLAYWRIGHT_CHROMIUM_ARGS || '')
@@ -18,7 +21,9 @@ export async function ensureBrowser() {
     .filter(Boolean);
   browser = await chromium.launch({
     headless: true,
-    args: launchArgs.length ? launchArgs : ['--no-sandbox', '--disable-dev-shm-usage', '--single-process'],
+    args: launchArgs.length
+      ? launchArgs
+      : ['--no-sandbox', '--disable-dev-shm-usage', '--single-process'],
   });
   return browser;
 }
@@ -38,23 +43,36 @@ export async function getFirstOrganicListing(listUrl, logger) {
     await page.goto(listUrl, { waitUntil: 'domcontentloaded', timeout: NAV_TIMEOUT });
 
     await dismissCookies(page);
-
     await page.waitForSelector('li.hz-Listing', { timeout: NAV_TIMEOUT });
-    // small scroll to trigger lazy content (but fast)
+
+    // kleine scroll om lazy content te triggeren
     await page.evaluate(() => window.scrollBy(0, 700));
     await page.waitForTimeout(150);
 
-    // Only cards with date (normal listing), then we’ll skip priority ones
-    const candidates = page.locator('li.hz-Listing:has(.hz-Listing-listingDate)');
-    const total = Math.min(await candidates.count(), MAX_CARDS);
+    // We willen kaarten MET datum
+    const datedCards = page.locator('li.hz-Listing:has(.hz-Listing-listingDate)');
+
+    // Scroll door tot we minstens MAX_CARDS dated cards zien of het budget op is
+    const t0 = Date.now();
+    let lastCount = 0;
+    while (Date.now() - t0 < SCROLL_BUDGET_MS) {
+      const count = await datedCards.count();
+      if (count >= MAX_CARDS) break;
+      if (count === lastCount) await page.waitForTimeout(150);
+      await page.evaluate((y) => window.scrollBy(0, y), SCROLL_STEP_PX);
+      await page.waitForTimeout(220);
+      lastCount = count;
+    }
+
+    const total = Math.min(await datedCards.count(), MAX_CARDS);
 
     for (let i = 0; i < total; i++) {
-      const card = candidates.nth(i);
+      const card = datedCards.nth(i);
       await card.waitFor({ state: 'attached', timeout: NAV_TIMEOUT });
 
-      // Hard skip: any priority badge/text
+      // Skip topadvertenties/gesponsord (badge + tekst)
       const hasPriority = (await safeCount(card, '.hz-Listing-priority')) > 0;
-      const text = ((await safeText(card, ':scope')) || '').toLowerCase();
+      const text = ((await card.textContent().catch(() => null)) || '').toLowerCase();
       const isAd =
         hasPriority ||
         text.includes('topadvertentie') ||
@@ -63,7 +81,7 @@ export async function getFirstOrganicListing(listUrl, logger) {
         /\badvertentie\b/.test(text);
       if (isAd) continue;
 
-      // ---- Required: url + title
+      // ---- Verplicht: url + titel
       const href =
         (await safeAttr(card, 'a[href*="/v/auto-s/"]', 'href')) ??
         (await safeAttr(card, 'a[href]', 'href'));
@@ -76,7 +94,7 @@ export async function getFirstOrganicListing(listUrl, logger) {
 
       if (!url || !title) continue;
 
-      // ---- Optional fields
+      // ---- Optioneel (best-effort)
       const priceRaw = await safeText(
         card,
         '[data-testid="price-box-price"], .hz-Listing-price, [class*="price"]'
@@ -84,19 +102,19 @@ export async function getFirstOrganicListing(listUrl, logger) {
       const priceEUR = parsePriceEUR(priceRaw);
       const date = await safeText(card, '.hz-Listing-listingDate');
 
-      // Icon attributes (year, mileage, fuel, transmission, body)
+      // Icon-rij: jaar/km/brandstof/transmissie/carrosserie
       const attrTexts = await safeTexts(card, '.hz-Attribute.hz-Attribute--default');
       const { year, mileageKm, fuel, transmission, body } = classifyAttributes(attrTexts);
 
-      // Options
+      // Opties
       const optionsText = await safeText(card, '.hz-Listing-attribute-options');
       const options = optionsText ? optionsText.split(',').map((t) => clean(t)).filter(Boolean) : null;
 
-      // Seller info
+      // Verkoper + stad
       const sellerName = await safeText(card, '.hz-Listing-seller-name');
       const sellerCity = await safeText(card, '.hz-Listing-sellerLocation');
 
-      // adId from URL
+      // adId uit URL
       let adId = null;
       if (url) {
         const m = url.match(/m(\d+)-/);
@@ -125,13 +143,13 @@ export async function getFirstOrganicListing(listUrl, logger) {
       };
     }
 
-    throw new Error('Geen normale (niet-gesponsorde) kaart gevonden in de eerste 10.');
+    throw new Error(`Geen normale (niet-gesponsorde) kaart gevonden in de eerste ${total || 0}.`);
   } finally {
-    await context.close(); // keep browser alive, only close context
+    await context.close(); // browser open laten voor volgende requests
   }
 }
 
-/* ---------- helpers: always fast & non-blocking ---------- */
+/* ---------- helpers ---------- */
 
 async function safeText(scope, selector) {
   try {
@@ -176,6 +194,7 @@ function parseKm(raw) {
   const digits = m[1].replace(/[^\d]/g, '');
   return digits ? parseInt(digits, 10) : null;
 }
+
 function classifyAttributes(items) {
   const norm = (s) => (s || '').toString().normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase();
   const fuels = ['diesel','benzine','essence','petrol','elektrisch','electrique','electric','hybride','hybrid','plug-in hybride','plugin hybride','cng','lpg'];
@@ -186,6 +205,7 @@ function classifyAttributes(items) {
 
   for (const raw of items) {
     const t = norm(raw);
+
     const y = (raw.match(/(?:19|20)\d{2}/) || [])[0];
     if (!year && y && +y >= 1950 && +y <= 2035) year = y;
 
