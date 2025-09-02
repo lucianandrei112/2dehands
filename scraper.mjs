@@ -1,6 +1,6 @@
 import { chromium } from 'playwright';
 
-const NAV_TIMEOUT = 10000;                        // snel falen i.p.v. hangen
+const NAV_TIMEOUT = 10000;
 const SHORT_TIMEOUT = 600;
 const MAX_CARDS = Number(process.env.MAX_CARDS || 25);
 const SCROLL_BUDGET_MS = Number(process.env.SCROLL_BUDGET_MS || 7000);
@@ -49,7 +49,6 @@ export async function getFirstOrganicListing(listUrl, logger) {
     return await doScrape(listUrl, logger);
   } catch (err) {
     const msg = String(err?.message || err);
-    // Als de browser/target gesloten is → herstart en nog 1 poging
     if (/Target .* (closed|crash)|has been closed|browser has been closed/i.test(msg)) {
       await closeBrowser();
       await ensureBrowser();
@@ -67,20 +66,31 @@ async function doScrape(listUrl, logger) {
     context = await b.newContext({ locale: 'nl-BE', userAgent: UA, deviceScaleFactor: 1 });
     page = await context.newPage();
 
-    logger?.debug?.({ listUrl }, 'goto');
-    await page.goto(listUrl, { waitUntil: 'domcontentloaded', timeout: NAV_TIMEOUT });
+    // cache-buster zodat we écht de nieuwste data krijgen
+    const urlWithTs = listUrl + (listUrl.includes('?') ? '&' : '?') + `_ts=${Date.now()}`;
+
+    logger?.debug?.({ urlWithTs }, 'goto');
+    await page.goto(urlWithTs, { waitUntil: 'domcontentloaded', timeout: NAV_TIMEOUT });
 
     await dismissCookies(page);
+
     await page.waitForSelector('li.hz-Listing', { timeout: NAV_TIMEOUT });
+
+    // Forceren: sorteren op Datum/Recent
+    await forceSortByDate(page);
+
+    // beginnen vanaf de top
+    await page.evaluate(() => window.scrollTo(0, 0));
+    await page.waitForTimeout(120);
 
     // kleine scroll om lazy content te triggeren
     await page.evaluate(() => window.scrollBy(0, 700));
     await page.waitForTimeout(150);
 
-    // We willen kaarten MET datum
+    // Kaarten MET datum
     const datedCards = page.locator('li.hz-Listing:has(.hz-Listing-listingDate)');
 
-    // Scroll door tot we minstens MAX_CARDS dated cards zien of het budget op is
+    // Scroll tot we minstens MAX_CARDS dated cards hebben of budget op is
     const t0 = Date.now();
     let lastCount = 0;
     while (Date.now() - t0 < SCROLL_BUDGET_MS) {
@@ -175,8 +185,85 @@ async function doScrape(listUrl, logger) {
   } finally {
     try { if (page) await page.close(); } catch {}
     try { if (context) await context.close(); } catch {}
-    // browser blijft open voor volgende request
   }
+}
+
+/* ---------- force sort by DATE (Nieuwste) ---------- */
+async function forceSortByDate(page) {
+  // 1) Neem eerste href MET datum (voor/na-vergelijking)
+  const firstHrefBefore = await firstDatedCardHref(page);
+
+  // 2) Probeer het sort-menu te openen
+  const openers = [
+    'button:has-text("Standaard")',
+    'button:has-text("Standard")',
+    'button:has-text("Sorteren")',
+    '[aria-haspopup="listbox"]',
+    '[data-testid*="sort"] button',
+    'select'
+  ];
+
+  for (const sel of openers) {
+    try {
+      const btn = page.locator(sel).first();
+      if (await btn.isVisible({ timeout: 800 })) {
+        await btn.click().catch(() => {});
+        await page.waitForTimeout(120);
+        if (sel === 'select') {
+          // Als het een echte <select> is
+          const ok = await page.locator('select').first().isVisible().catch(() => false);
+          if (ok) {
+            // probeer options met 'DATE', 'recent'
+            await page.selectOption('select', [
+              { label: /Datum|Date|Meest recent|Nieuwste|Plus récentes/i },
+              { value: /DATE|RECENT/i }
+            ]).catch(() => {});
+          }
+        } else {
+          // 3) Klik op de optie die "Datum" / "Date" / "Meest recent" betekent
+          const options = [
+            '[role="option"]:has-text("Datum")',
+            '[role="option"]:has-text("Date")',
+            '[role="option"]:has-text("Meest recent")',
+            '[role="option"]:has-text("Nieuwste")',
+            '[role="option"]:has-text("Plus récentes")',
+            'li:has-text("Datum")',
+            'li:has-text("Date")',
+            'li:has-text("Meest recent")',
+            'li:has-text("Nieuwste")',
+            'li:has-text("Plus récentes")'
+          ];
+          for (const optSel of options) {
+            const opt = page.locator(optSel).first();
+            if (await opt.isVisible({ timeout: 400 })) {
+              await opt.click().catch(() => {});
+              break;
+            }
+          }
+        }
+        break;
+      }
+    } catch {}
+  }
+
+  // 4) Wacht even en controleer of de bovenste kaart veranderde
+  await page.waitForTimeout(400);
+  const firstHrefAfter = await firstDatedCardHref(page);
+  if (firstHrefBefore && firstHrefAfter && firstHrefAfter === firstHrefBefore) {
+    // fallback: kleine refresh met dezelfde hash (client forceert resort)
+    await page.evaluate(() => location.reload());
+    await page.waitForSelector('li.hz-Listing', { timeout: NAV_TIMEOUT }).catch(() => {});
+  }
+}
+
+async function firstDatedCardHref(page) {
+  try {
+    const card = page.locator('li.hz-Listing:has(.hz-Listing-listingDate)').first();
+    await card.waitFor({ state: 'attached', timeout: 1200 }).catch(() => {});
+    const href =
+      (await card.locator('a[href*="/v/"]').first().getAttribute('href').catch(() => null)) ?? null;
+    return href;
+  } catch { return null; }
 }
 
 /* ---------- helpers ---------- */
