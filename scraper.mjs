@@ -67,14 +67,14 @@ async function doScrape(listUrl, logger) {
     },
   });
 
-  // client state weg (soms beïnvloedt dat de lijst)
+  // client state weg
   await context.addInitScript(() => {
     try { localStorage.clear(); } catch {}
     try { sessionStorage.clear(); } catch {}
     try { caches?.keys?.().then(keys => keys.forEach(k => caches.delete(k))); } catch {}
   });
 
-  // zware assets blokkeren (sneller/stabieler)
+  // zware assets blokkeren
   await context.route('**/*', (route) => {
     const rt = route.request().resourceType();
     if (rt === 'image' || rt === 'font' || rt === 'media') return route.abort();
@@ -84,16 +84,13 @@ async function doScrape(listUrl, logger) {
   const page = await context.newPage();
 
   try {
-    // **BELANGRIJK**: cache-buster vóór de '#'
     const urlWithTs = addCacheBuster(listUrl);
-
     logger?.debug?.({ urlWithTs }, 'goto');
     await page.goto(urlWithTs, { waitUntil: 'domcontentloaded', timeout: NAV_TIMEOUT });
     await page.waitForLoadState('networkidle', { timeout: 3000 }).catch(() => {});
 
     await dismissCookies(page);
 
-    // echt bovenaan starten + mini nudge voor lazy render
     await page.waitForSelector('li.hz-Listing', { timeout: NAV_TIMEOUT });
     await page.evaluate(() => window.scrollTo(0, 0));
     await page.waitForTimeout(120);
@@ -115,30 +112,17 @@ async function doScrape(listUrl, logger) {
 
     let card = page.locator(nonAdSel).first();
 
-    // kort scrollen totdat er eentje zichtbaar is (binnen budget)
     const t0 = Date.now();
     while ((await card.count()) === 0 && Date.now() - t0 < SCROLL_BUDGET_MS) {
       await page.evaluate((y) => window.scrollBy(0, y), SCROLL_STEP_PX);
       await page.waitForTimeout(180);
       card = page.locator(nonAdSel).first();
     }
-
-    if ((await card.count()) === 0) {
-      throw new Error('Geen normale (niet-gesponsorde) kaart gevonden.');
-    }
-
+    if ((await card.count()) === 0) throw new Error('Geen normale (niet-gesponsorde) kaart gevonden.');
     await card.waitFor({ state: 'attached', timeout: NAV_TIMEOUT });
 
-    // ---- verplichte velden
-    const href =
-      (await safeAttr(card, 'a[href*="/v/auto-s/"]', 'href')) ??
-      (await safeAttr(card, 'a[href]', 'href'));
-    const origin = await page.evaluate(() => location.origin);
-    const url = href ? new URL(href, origin).href : null;
-
-    const title =
-      (await safeText(card, '[data-testid="listing-title"], h3, h2, a[title]')) ||
-      (await safeText(card, 'a[title]'));
+    // ---- url + titel met robuuste fallback
+    const { url, title } = await resolveUrlAndTitle(card, page);
     if (!url || !title) throw new Error('Kaart onvolledig (geen url/titel).');
 
     // ---- optioneel
@@ -178,7 +162,7 @@ async function doScrape(listUrl, logger) {
       sellerName: clean(sellerName),
       sellerCity: clean(sellerCity),
       scrapedAt: new Date().toISOString(),
-      listUrlUsed: listUrl, // zonder _ts teruggeven
+      listUrlUsed: listUrl,
     };
   } finally {
     try { await page.close(); } catch {}
@@ -186,15 +170,79 @@ async function doScrape(listUrl, logger) {
   }
 }
 
+/* ---------- url/titel super-robust + detail-fallback ---------- */
+async function resolveUrlAndTitle(card, page) {
+  const origin = await page.evaluate(() => location.origin);
+
+  // 1) Probeer diverse link selectors (meest specifiek → algemeen)
+  const linkSelectors = [
+    'a[data-testid="listing-link"]',
+    'a:has([data-testid="listing-title"])',
+    'a[href*="/v/auto-s/"]',
+    'a[href*="/v/"]',
+    'a[href^="/v"]',
+    'a[href*="/m"]',
+    'a[href]' // allerlaatste redmiddel
+  ];
+
+  let link = null;
+  for (const sel of linkSelectors) {
+    const loc = card.locator(sel).first();
+    if (await loc.count()) { link = loc; break; }
+  }
+
+  let href = null;
+  if (link) {
+    href = await link.getAttribute('href').catch(() => null);
+  }
+  const url = href ? new URL(href, origin).href : null;
+
+  // titel: prefer data-testid, anders h3/h2, anders link title/aria-label/tekst
+  let title =
+    (await safeText(card, '[data-testid="listing-title"]')) ||
+    (await safeText(card, 'h3, h2')) ||
+    (link ? (await link.getAttribute('title').catch(() => null)) : null) ||
+    (link ? (await link.getAttribute('aria-label').catch(() => null)) : null) ||
+    (link ? (await link.textContent().catch(() => null)) : null);
+
+  title = clean(title);
+
+  // 2) Als nog steeds geen url of titel → open kort de detailpagina en lees daar
+  if ((!url || !title) && link) {
+    try {
+      await link.scrollIntoViewIfNeeded().catch(() => {});
+      const [detail] = await Promise.all([
+        page.context().waitForEvent('page'),
+        link.click({ button: 'middle' }) // open in nieuwe tab
+      ]);
+      await detail.waitForLoadState('domcontentloaded', { timeout: 5000 }).catch(() => {});
+      const dUrl = detail.url();
+      // titel op detail: h1 of data-testid varianten
+      const dTitle =
+        (await detail.locator('h1, [data-testid="ad-title"], [data-testid="listing-title"]').first().textContent({ timeout: 2000 }).catch(() => null)) ||
+        null;
+      await detail.close().catch(() => {});
+
+      return {
+        url: url || dUrl || null,
+        title: clean(title || dTitle) || null,
+      };
+    } catch {
+      // negeer; val terug op wat we hebben
+    }
+  }
+
+  return { url: url || null, title: title || null };
+}
+
 /* ---------- helpers ---------- */
 
 function addCacheBuster(u) {
-  // voeg ?_ts=... TÓCH vóór de '#...' in
   const ts = `_ts=${Date.now()}_${Math.random().toString(36).slice(2)}`;
   const i = u.indexOf('#');
   if (i === -1) return u + (u.includes('?') ? '&' : '?') + ts;
   const base = u.slice(0, i);
-  const hash = u.slice(i); // inclusief '#...'
+  const hash = u.slice(i);
   return base + (base.includes('?') ? '&' : '?') + ts + hash;
 }
 
