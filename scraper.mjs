@@ -24,7 +24,7 @@ export async function getFirstOrganicListing(listUrl, logger) {
     await page.waitForTimeout(200);
 
     const candidates = page.locator('li.hz-Listing:has(.hz-Listing-listingDate)');
-    const total = Math.min(await candidates.count(), 15);
+    const total = Math.min(await candidates.count(), 30);
 
     for (let i = 0; i < total; i++) {
       const card = candidates.nth(i);
