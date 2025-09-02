@@ -1,10 +1,11 @@
 import { chromium } from 'playwright';
 
-const DEFAULT_TIMEOUT = 25000;
+const DEFAULT_TIMEOUT = 30000;
+const SHORT_TIMEOUT = 1200;
 const clean = (s) => (s ?? '').replace(/\s+/g, ' ').trim() || null;
 
 export async function getFirstOrganicListing(listUrl, logger) {
-  const browser = await chromium.launch(); // headless in Playwright base image
+  const browser = await chromium.launch();
   const context = await browser.newContext({
     locale: 'nl-BE',
     userAgent:
@@ -16,53 +17,52 @@ export async function getFirstOrganicListing(listUrl, logger) {
     logger?.info({ listUrl }, 'Navigating to list URL');
     await page.goto(listUrl, { waitUntil: 'domcontentloaded', timeout: DEFAULT_TIMEOUT });
 
-    // Cookie banner wegklikken
     await dismissCookies(page);
 
-    // Zorg dat er listings zijn
+    // Wacht op 1e batch kaarten en trigger lazy content
     await page.waitForSelector('li.hz-Listing', { timeout: DEFAULT_TIMEOUT });
-
-    // Scroll klein stukje voor lazy content
-    await page.evaluate(() => window.scrollBy(0, 800));
+    await page.evaluate(() => window.scrollBy(0, 1000));
     await page.waitForTimeout(300);
 
-    // >>> SLEUTEL: eerste kaart MET datum EN ZONDER priority-badge
+    // SLEUTEL: eerste kaart MET datum EN ZONDER priority-badge
     const card = page
       .locator('li.hz-Listing:has(.hz-Listing-listingDate):not(:has(.hz-Listing-priority))')
       .first();
 
-    // Wacht tot zo'n kaart effectief bestaat, anders error
+    // Wacht dat zo’n kaart effectief bestaat en renderbaar is
     await card.waitFor({ state: 'attached', timeout: DEFAULT_TIMEOUT });
 
-    // Extract met locators (geen $$eval/loops meer)
+    // helper voor optionele textcontent
+    const getText = async (loc) => {
+      try {
+        const handle = card.locator(loc).first();
+        if (await handle.count() === 0) return null;
+        return clean(await handle.textContent({ timeout: SHORT_TIMEOUT }));
+      } catch {
+        return null;
+      }
+    };
+
+    // URL
     const href =
-      (await card.locator('a[href*="/v/auto-s/"]').first().getAttribute('href')) ??
-      (await card.locator('a[href]').first().getAttribute('href'));
+      (await card.locator('a[href*="/v/auto-s/"]').first().getAttribute('href').catch(() => null)) ??
+      (await card.locator('a[href]').first().getAttribute('href').catch(() => null));
     const pageOrigin = await page.evaluate(() => globalThis.location.origin);
     const url = href ? new URL(href, pageOrigin).href : null;
 
+    // Titel (verplicht)
     const title =
-      (await card
-        .locator('[data-testid="listing-title"], h3, h2, a[title]')
-        .first()
-        .textContent()) || null;
+      (await getText('[data-testid="listing-title"], h3, h2, a[title]')) ||
+      (await getText('a[title]'));
 
-    const rawPrice =
-      (await card
-        .locator('[data-testid="price-box-price"], .hz-Listing-price, [class*="price"]')
-        .first()
-        .textContent()) || null;
+    // Optioneel
+    const rawPrice = await getText(
+      '[data-testid="price-box-price"], .hz-Listing-price, [class*="price"]'
+    );
+    const date = await getText('.hz-Listing-listingDate');
+    const locationText = await getText('[data-testid="location-name"], .hz-Listing-location');
 
-    const date =
-      (await card.locator('.hz-Listing-listingDate').first().textContent()) || null;
-
-    const locText =
-      (await card
-        .locator('[data-testid="location-name"], .hz-Listing-location')
-        .first()
-        .textContent()) || null;
-
-    // adId uit URL
+    // adId
     let adId = null;
     if (url) {
       const m = url.match(/m(\d+)-/);
@@ -75,10 +75,10 @@ export async function getFirstOrganicListing(listUrl, logger) {
 
     return {
       url,
-      title: clean(title),
-      price: clean(rawPrice ? rawPrice.replace(/[^\d.,]/g, '') : null),
-      location: clean(locText),
-      date: clean(date),
+      title,
+      price: rawPrice ? rawPrice.replace(/[^\d.,]/g, '') : null,
+      location: locationText,
+      date,
       adId,
       scrapedAt: new Date().toISOString(),
       listUrlUsed: listUrl
@@ -90,28 +90,25 @@ export async function getFirstOrganicListing(listUrl, logger) {
 }
 
 async function dismissCookies(page) {
-  // 1) standaard OneTrust id
+  // 1) OneTrust id
   try {
     const btn = page.locator('#onetrust-accept-btn-handler');
-    if (await btn.isVisible({ timeout: 2000 })) {
-      await btn.click();
-      return;
+    if (await btn.isVisible({ timeout: 1500 })) {
+      await btn.click(); return;
     }
   } catch {}
-  // 2) “Doorgaan zonder te accepteren”
+  // 2) Doorgaan zonder te accepteren
   try {
     const noBtn = page.locator('button:has-text("Doorgaan zonder te accepteren")');
-    if (await noBtn.first().isVisible({ timeout: 1500 })) {
-      await noBtn.first().click();
-      return;
+    if (await noBtn.first().isVisible({ timeout: 1000 })) {
+      await noBtn.first().click(); return;
     }
   } catch {}
-  // 3) “Accepteren”
+  // 3) Accepteren
   try {
     const acc = page.locator('button:has-text("Accepteren")');
-    if (await acc.first().isVisible({ timeout: 1500 })) {
-      await acc.first().click();
-      return;
+    if (await acc.first().isVisible({ timeout: 1000 })) {
+      await acc.first().click(); return;
     }
   } catch {}
 }
