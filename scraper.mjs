@@ -2,7 +2,7 @@ import { chromium } from 'playwright';
 
 const NAV_TIMEOUT = 10000;   // keep tight so we fail fast instead of hanging
 const SHORT_TIMEOUT = 600;
-const MAX_CARDS = 10;        // inspect only first 10 non-top cards for speed
+const MAX_CARDS = 20;        // inspect only first 10 non-top cards for speed
 const UA =
   'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/118.0.0.0 Safari/537.36';
 
