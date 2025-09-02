@@ -1,20 +1,28 @@
 import { chromium } from 'playwright';
+import fs from 'node:fs';
 
-const NAV_TIMEOUT = 10000;                        // snel falen i.p.v. hangen
+// ---------- tuning ----------
+const NAV_TIMEOUT = 10000;               // snel falen i.p.v. hangen
 const SHORT_TIMEOUT = 600;
 const MAX_CARDS = Number(process.env.MAX_CARDS || 25);
 const SCROLL_BUDGET_MS = Number(process.env.SCROLL_BUDGET_MS || 7000);
 const SCROLL_STEP_PX = Number(process.env.SCROLL_STEP_PX || 2000);
 
+// anti-rate-limit
+const JITTER_MIN_MS = Number(process.env.JITTER_MIN_MS || 1200);
+const JITTER_MAX_MS = Number(process.env.JITTER_MAX_MS || 4200);
+const STORAGE_PATH  = process.env.STORAGE_PATH  || '/tmp/2dehands_state.json';
+
 const UA =
   'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/118.0.0.0 Safari/537.36';
 
 const clean = (s) => (s ?? '').replace(/\s+/g, ' ').trim() || null;
+const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+const randInt = (a,b) => Math.floor(Math.random()*(b-a+1))+a;
 
 let browser;
 
 /* ------------ Browser lifecycle (reliable) ------------ */
-
 async function launchBrowser() {
   const launchArgs = (process.env.PLAYWRIGHT_CHROMIUM_ARGS || '')
     .split(' ')
@@ -28,7 +36,6 @@ async function launchBrowser() {
   return browser;
 }
 
-/** Launch once & reuse. Relaunch when disconnected/crashed. */
 export async function ensureBrowser() {
   if (!browser || (typeof browser.isConnected === 'function' && !browser.isConnected())) {
     try { if (browser) await browser.close(); } catch {}
@@ -43,13 +50,11 @@ export async function closeBrowser() {
 }
 
 /* ------------ Main scrape with 1 automatic retry ------------ */
-
 export async function getFirstOrganicListing(listUrl, logger) {
   try {
     return await doScrape(listUrl, logger);
   } catch (err) {
     const msg = String(err?.message || err);
-    // Als de browser/target gesloten is → herstart en nog 1 poging
     if (/Target .* (closed|crash)|has been closed|browser has been closed/i.test(msg)) {
       await closeBrowser();
       await ensureBrowser();
@@ -64,16 +69,46 @@ async function doScrape(listUrl, logger) {
   let context, page;
 
   try {
-    context = await b.newContext({ locale: 'nl-BE', userAgent: UA, deviceScaleFactor: 1 });
+    // persistente sessie (cookies/localStorage) → minder “robot”
+    const storageState = fs.existsSync(STORAGE_PATH) ? STORAGE_PATH : undefined;
+
+    context = await b.newContext({
+      locale: 'nl-BE',
+      timezoneId: 'Europe/Brussels',
+      userAgent: UA,
+      deviceScaleFactor: 1,
+      storageState,
+      extraHTTPHeaders: {
+        'Accept-Language': 'nl-BE,nl;q=0.9,fr-BE;q=0.8,fr;q=0.7,en;q=0.6',
+        'Cache-Control': 'no-cache',
+        'Pragma': 'no-cache',
+        'Referer': 'https://www.2dehands.be/',
+      },
+    });
+
+    // zware assets blokkeren (sneller, minder opvallend)
+    await context.route('**/*', (route) => {
+      const rt = route.request().resourceType();
+      if (rt === 'image' || rt === 'font' || rt === 'media') return route.abort();
+      return route.continue();
+    });
+
     page = await context.newPage();
 
-    logger?.debug?.({ listUrl }, 'goto');
-    await page.goto(listUrl, { waitUntil: 'domcontentloaded', timeout: NAV_TIMEOUT });
+    // kleine willekeurige pauze (jitter) → natuurlijker
+    await sleep(randInt(JITTER_MIN_MS, JITTER_MAX_MS));
+
+    // cache-buster vóór de hash, zo forceer je echt een verse lijst
+    const urlWithTs = addCacheBuster(listUrl);
+    logger?.debug?.({ urlWithTs }, 'goto');
+    await page.goto(urlWithTs, { waitUntil: 'domcontentloaded', timeout: NAV_TIMEOUT });
 
     await dismissCookies(page);
     await page.waitForSelector('li.hz-Listing', { timeout: NAV_TIMEOUT });
 
     // kleine scroll om lazy content te triggeren
+    await page.evaluate(() => window.scrollTo(0, 0));
+    await page.waitForTimeout(120);
     await page.evaluate(() => window.scrollBy(0, 700));
     await page.waitForTimeout(150);
 
@@ -173,6 +208,9 @@ async function doScrape(listUrl, logger) {
 
     throw new Error(`Geen normale (niet-gesponsorde) kaart gevonden in de eerste ${total || 0}.`);
   } finally {
+    // sessie/cookies bewaren voor volgende run (minder frictie/captcha/banner)
+    try { if (context) await context.storageState({ path: STORAGE_PATH }); } catch {}
+
     try { if (page) await page.close(); } catch {}
     try { if (context) await context.close(); } catch {}
     // browser blijft open voor volgende request
@@ -180,6 +218,16 @@ async function doScrape(listUrl, logger) {
 }
 
 /* ---------- helpers ---------- */
+
+function addCacheBuster(u) {
+  // voeg ?_ts=... vóór de '#...' in
+  const ts = `_ts=${Date.now()}_${Math.random().toString(36).slice(2)}`;
+  const i = u.indexOf('#');
+  if (i === -1) return u + (u.includes('?') ? '&' : '?') + ts;
+  const base = u.slice(0, i);
+  const hash = u.slice(i);
+  return base + (base.includes('?') ? '&' : '?') + ts + hash;
+}
 
 async function safeText(scope, selector) {
   try {
