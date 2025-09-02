@@ -4,7 +4,7 @@ const DEFAULT_TIMEOUT = 25000;
 const clean = (s) => (s ?? '').replace(/\s+/g, ' ').trim() || null;
 
 export async function getFirstOrganicListing(listUrl, logger) {
-  const browser = await chromium.launch(); // base image = headless OK
+  const browser = await chromium.launch(); // base image draait headless
   const context = await browser.newContext({
     locale: 'nl-BE',
     userAgent:
@@ -16,32 +16,36 @@ export async function getFirstOrganicListing(listUrl, logger) {
     logger?.info({ listUrl }, 'Navigating to list URL');
     await page.goto(listUrl, { waitUntil: 'domcontentloaded', timeout: DEFAULT_TIMEOUT });
 
-    // Cookie banner (OneTrust) wegklikken – meerdere fallbacks
+    // Cookie banner wegklikken
     await dismissCookies(page);
 
-    // Wacht op eerste listings
+    // Wacht op listings
     await page.waitForSelector('li.hz-Listing', { timeout: DEFAULT_TIMEOUT });
 
-    // Klein scrolltje voor lazy content
+    // Scroll klein stukje voor lazy content
     await page.evaluate(() => window.scrollBy(0, 800));
     await page.waitForTimeout(400);
 
     const result = await page.$$eval('li.hz-Listing', (cards) => {
       const isSponsored = (card) => {
-        // 1) badge klasse
         if (card.querySelector('.hz-Listing-priority')) return true;
-        // 2) tekstuele labels
         const t = (card.innerText || '').toLowerCase();
         if (/(topzoekertje|topadvertentie|advertentie|gesponsord)/i.test(t)) return true;
         return false;
       };
 
       const extract = (card) => {
+        const pageOrigin =
+          (globalThis && globalThis.location && globalThis.location.origin) ||
+          (document && document.location && document.location.origin) ||
+          '';
+
         // Link naar detail
         const a =
           card.querySelector('a[href*="/v/auto-s/"]') ||
           card.querySelector('a[href*="/v/auto-s"], a[href*="/v/"]');
-        const url = a ? new URL(a.href, location.origin).href : null;
+        const href = a ? a.getAttribute('href') : null;
+        const url = href ? new URL(href, pageOrigin).href : null;
 
         // Titel
         const titleEl = card.querySelector('[data-testid="listing-title"], h3, h2');
@@ -52,13 +56,12 @@ export async function getFirstOrganicListing(listUrl, logger) {
           card.querySelector('[data-testid="price-box-price"], .hz-Listing-price, [class*="price"]');
         const price = priceEl ? priceEl.textContent.replace(/[^\d.,]/g, '').trim() : null;
 
-        // Datum/locatie (optioneel)
+        // Datum / locatie
         const dateEl = card.querySelector('.hz-Listing-listingDate');
         const date = dateEl ? dateEl.textContent.trim() : null;
 
-        const locationEl =
-          card.querySelector('[data-testid="location-name"], .hz-Listing-location');
-        const location = locationEl ? locationEl.textContent.trim() : null;
+        const locEl = card.querySelector('[data-testid="location-name"], .hz-Listing-location');
+        const loc = locEl ? locEl.textContent.trim() : null;
 
         // ID uit URL
         let adId = null;
@@ -69,12 +72,11 @@ export async function getFirstOrganicListing(listUrl, logger) {
           if (!adId && m2) adId = m2[1];
         }
 
-        return { url, title, price, location, date, adId };
+        return { url, title, price, loc, date, adId };
       };
 
       for (const card of cards) {
-        // skip promo-li's zonder link
-        if (!card.querySelector('a')) continue;
+        if (!card.querySelector('a')) continue; // skip promo-li's
         if (!isSponsored(card)) {
           const data = extract(card);
           if (data.url && data.title) return data;
@@ -89,7 +91,7 @@ export async function getFirstOrganicListing(listUrl, logger) {
       ...result,
       title: clean(result.title),
       price: clean(result.price),
-      location: clean(result.location),
+      location: clean(result.loc), // loc -> location
       date: clean(result.date),
       scrapedAt: new Date().toISOString(),
       listUrlUsed: listUrl
