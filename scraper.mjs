@@ -2,7 +2,7 @@ import { chromium } from 'playwright';
 import fs from 'node:fs';
 
 // ---------- tuning ----------
-const NAV_TIMEOUT = 10000;               // snel falen i.p.v. hangen
+const NAV_TIMEOUT = Number(process.env.NAV_TIMEOUT || 45000); // ruimer: geef XHR/filters tijd
 const SHORT_TIMEOUT = 600;
 const MAX_CARDS = Number(process.env.MAX_CARDS || 25);
 const SCROLL_BUDGET_MS = Number(process.env.SCROLL_BUDGET_MS || 7000);
@@ -11,10 +11,19 @@ const SCROLL_STEP_PX = Number(process.env.SCROLL_STEP_PX || 2000);
 // anti-rate-limit
 const JITTER_MIN_MS = Number(process.env.JITTER_MIN_MS || 1200);
 const JITTER_MAX_MS = Number(process.env.JITTER_MAX_MS || 4200);
-const STORAGE_PATH  = process.env.STORAGE_PATH  || '/tmp/2dehands_state.json';
 
-const UA =
-  'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/118.0.0.0 Safari/537.36';
+// sessie & state
+const STORAGE_PATH  = process.env.STORAGE_PATH  || '/tmp/2dehands_state.json'; // playwright storageState
+const LAST_STATE_PATH = process.env.LAST_STATE_PATH || '/tmp/2dehands_last.json'; // eigen dedupe
+const FRESH_SESSION = process.env.FRESH_SESSION === '1';
+
+// UA
+const UA_POOL = [
+  'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/118.0.0.0 Safari/537.36',
+  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/118.0.0.0 Safari/537.36',
+  'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/118.0.0.0 Safari/537.36',
+];
+const UA = process.env.UA || UA_POOL[Math.floor(Math.random() * UA_POOL.length)];
 
 const clean = (s) => (s ?? '').replace(/\s+/g, ' ').trim() || null;
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
@@ -22,7 +31,7 @@ const randInt = (a,b) => Math.floor(Math.random()*(b-a+1))+a;
 
 let browser;
 
-/* ------------ Browser lifecycle (reliable) ------------ */
+/* ------------ Browser lifecycle ------------ */
 async function launchBrowser() {
   const launchArgs = (process.env.PLAYWRIGHT_CHROMIUM_ARGS || '')
     .split(' ')
@@ -69,8 +78,7 @@ async function doScrape(listUrl, logger) {
   let context, page;
 
   try {
-    // persistente sessie (cookies/localStorage) → minder “robot”
-    const storageState = fs.existsSync(STORAGE_PATH) ? STORAGE_PATH : undefined;
+    const storageState = (!FRESH_SESSION && fs.existsSync(STORAGE_PATH)) ? STORAGE_PATH : undefined;
 
     context = await b.newContext({
       locale: 'nl-BE',
@@ -101,123 +109,191 @@ async function doScrape(listUrl, logger) {
     // cache-buster vóór de hash, zo forceer je echt een verse lijst
     const urlWithTs = addCacheBuster(listUrl);
     logger?.debug?.({ urlWithTs }, 'goto');
-    await page.goto(urlWithTs, { waitUntil: 'domcontentloaded', timeout: NAV_TIMEOUT });
+    await page.goto(urlWithTs, { waitUntil: 'networkidle', timeout: NAV_TIMEOUT });
 
     await dismissCookies(page);
     await page.waitForSelector('li.hz-Listing', { timeout: NAV_TIMEOUT });
 
-    // kleine scroll om lazy content te triggeren
+    // tiny scroll om lazy content te triggeren
     await page.evaluate(() => window.scrollTo(0, 0));
     await page.waitForTimeout(120);
     await page.evaluate(() => window.scrollBy(0, 700));
     await page.waitForTimeout(150);
 
-    // We willen kaarten MET datum
-    const datedCards = page.locator('li.hz-Listing:has(.hz-Listing-listingDate)');
+    // ---- WACHT TOT FILTERS/SORT ECHT ACTIEF ZIJN ----
+    await waitForFiltersApplied(page);
 
-    // Scroll door tot we minstens MAX_CARDS dated cards zien of het budget op is
-    const t0 = Date.now();
-    let lastCount = 0;
-    while (Date.now() - t0 < SCROLL_BUDGET_MS) {
-      const count = await datedCards.count();
-      if (count >= MAX_CARDS) break;
-      if (count === lastCount) await page.waitForTimeout(150);
-      await page.evaluate((y) => window.scrollBy(0, y), SCROLL_STEP_PX);
-      await page.waitForTimeout(220);
-      lastCount = count;
-    }
+    // ---- NU SCANNEN & PAKKEN ----
+    const record = await scanFirstRecord(page);
+    if (!record) throw new Error('Geen normale (niet-gesponsorde) kaart gevonden.');
 
-    const total = Math.min(await datedCards.count(), MAX_CARDS);
-
-    for (let i = 0; i < total; i++) {
-      const card = datedCards.nth(i);
-      await card.waitFor({ state: 'attached', timeout: NAV_TIMEOUT });
-
-      // Skip topadvertenties/gesponsord (badge + tekst)
-      const hasPriority = (await safeCount(card, '.hz-Listing-priority')) > 0;
-      const text = ((await card.textContent().catch(() => null)) || '').toLowerCase();
-      const isAd =
-        hasPriority ||
-        text.includes('topadvertentie') ||
-        text.includes('topzoekertje') ||
-        text.includes('gesponsord') ||
-        /\badvertentie\b/.test(text);
-      if (isAd) continue;
-
-      // ---- Verplicht: url + titel
-      const href =
-        (await safeAttr(card, 'a[href*="/v/auto-s/"]', 'href')) ??
-        (await safeAttr(card, 'a[href]', 'href'));
-      const pageOrigin = await page.evaluate(() => globalThis.location.origin);
-      const url = href ? new URL(href, pageOrigin).href : null;
-
-      const title =
-        (await safeText(card, '[data-testid="listing-title"], h3, h2, a[title]')) ||
-        (await safeText(card, 'a[title]'));
-
-      if (!url || !title) continue;
-
-      // ---- Optioneel (best-effort)
-      const priceRaw = await safeText(
-        card,
-        '[data-testid="price-box-price"], .hz-Listing-price, [class*="price"]'
-      );
-      const priceEUR = parsePriceEUR(priceRaw);
-      const date = await safeText(card, '.hz-Listing-listingDate');
-
-      // Icon-rij: jaar/km/brandstof/transmissie/carrosserie
-      const attrTexts = await safeTexts(card, '.hz-Attribute.hz-Attribute--default');
-      const { year, mileageKm, fuel, transmission, body } = classifyAttributes(attrTexts);
-
-      // Opties
-      const optionsText = await safeText(card, '.hz-Listing-attribute-options');
-      const options = optionsText ? optionsText.split(',').map((t) => clean(t)).filter(Boolean) : null;
-
-      // Verkoper + stad
-      const sellerName = await safeText(card, '.hz-Listing-seller-name');
-      const sellerCity = await safeText(card, '.hz-Listing-sellerLocation');
-
-      // adId uit URL
-      let adId = null;
-      if (url) {
-        const m = url.match(/m(\d+)-/);
-        if (m) adId = m[1];
-        const m2 = url.match(/\/(\d{9,})/);
-        if (!adId && m2) adId = m2[1];
+    // de-dupe: als gelijk aan vorige → één reload-try
+    const last = readLast();
+    if (last?.adId && last.adId === record.adId) {
+      await page.reload({ waitUntil: 'networkidle', timeout: NAV_TIMEOUT }).catch(() => {});
+      await dismissCookies(page);
+      await waitForFiltersApplied(page);
+      const retry = await scanFirstRecord(page);
+      if (retry && retry.adId !== record.adId) {
+        writeLast({ adId: retry.adId, at: Date.now() });
+        return retry;
       }
-
-      return {
-        url,
-        title: clean(title),
-        priceRaw: clean(priceRaw),
-        priceEUR,
-        date: clean(date),
-        adId,
-        year,
-        mileageKm,
-        fuel,
-        transmission,
-        body,
-        options,
-        sellerName: clean(sellerName),
-        sellerCity: clean(sellerCity),
-        scrapedAt: new Date().toISOString(),
-        listUrlUsed: listUrl,
-      };
+      // nog steeds hetzelfde: schrijf terug en geef door (caller kan zelf 204 doen)
+      writeLast({ adId: record.adId, at: Date.now() });
+      return { ...record, sameAsLast: true };
     }
 
-    throw new Error(`Geen normale (niet-gesponsorde) kaart gevonden in de eerste ${total || 0}.`);
+    writeLast({ adId: record.adId, at: Date.now() });
+    return record;
+
   } finally {
-    // sessie/cookies bewaren voor volgende run (minder frictie/captcha/banner)
-    try { if (context) await context.storageState({ path: STORAGE_PATH }); } catch {}
+    // sessie/cookies bewaren (tenzij FRESH_SESSION)
+    try { if (context && !FRESH_SESSION) await context.storageState({ path: STORAGE_PATH }); } catch {}
 
     try { if (page) await page.close(); } catch {}
     try { if (context) await context.close(); } catch {}
-    // browser blijft open voor volgende request
+    // browser blijft open
   }
 }
 
-/* ---------- helpers ---------- */
+/* ---------- scan helpers ---------- */
+
+async function scanFirstRecord(page) {
+  // kaarten met datumlabel
+  const datedCards = page.locator('li.hz-Listing:has(.hz-Listing-listingDate)');
+  // Scroll door tot we genoeg kaarten zien of budget op is
+  const t0 = Date.now();
+  let lastCount = 0;
+  while (Date.now() - t0 < SCROLL_BUDGET_MS) {
+    const count = await datedCards.count().catch(() => 0);
+    if (count >= MAX_CARDS) break;
+    if (count === lastCount) await page.waitForTimeout(150);
+    await page.evaluate((y) => window.scrollBy(0, y), SCROLL_STEP_PX);
+    await page.waitForTimeout(220);
+    lastCount = count;
+  }
+
+  const total = Math.min(await datedCards.count().catch(() => 0), MAX_CARDS);
+
+  for (let i = 0; i < total; i++) {
+    const card = datedCards.nth(i);
+    try { await card.waitFor({ state: 'attached', timeout: NAV_TIMEOUT }); } catch { continue; }
+
+    // Skip topadvertenties/gesponsord (badge + tekst)
+    const hasPriority = (await safeCount(card, '.hz-Listing-priority')) > 0;
+    const text = ((await card.textContent().catch(() => null)) || '').toLowerCase();
+    const isAd =
+      hasPriority ||
+      text.includes('topadvertentie') ||
+      text.includes('topzoekertje') ||
+      text.includes('gesponsord') ||
+      /\badvertentie\b/.test(text);
+    if (isAd) continue;
+
+    // url + titel verplicht
+    const href =
+      (await safeAttr(card, 'a[href*="/v/auto-s/"]', 'href')) ??
+      (await safeAttr(card, 'a[href]', 'href'));
+    const pageOrigin = await page.evaluate(() => globalThis.location.origin);
+    const url = href ? new URL(href, pageOrigin).href : null;
+
+    const title =
+      (await safeText(card, '[data-testid="listing-title"], h3, h2, a[title]')) ||
+      (await safeText(card, 'a[title]'));
+    if (!url || !title) continue;
+
+    // prijs / datum
+    const priceRaw = await safeText(
+      card,
+      '[data-testid="price-box-price"], .hz-Listing-price, [class*="price"]'
+    );
+    const priceEUR = parsePriceEUR(priceRaw);
+    const date = await safeText(card, '.hz-Listing-listingDate');
+
+    // icon-rij: jaar/km/brandstof/transmissie/carrosserie
+    const attrTexts = await safeTexts(card, '.hz-Attribute.hz-Attribute--default');
+    const { year, mileageKm, fuel, transmission, body } = classifyAttributes(attrTexts);
+
+    // opties
+    const optionsText = await safeText(card, '.hz-Listing-attribute-options');
+    const options = optionsText ? optionsText.split(',').map((t) => clean(t)).filter(Boolean) : null;
+
+    // verkoper + stad
+    const sellerName = await safeText(card, '.hz-Listing-seller-name');
+    const sellerCity = await safeText(card, '.hz-Listing-sellerLocation');
+
+    // adId
+    let adId = null;
+    if (url) {
+      const m = url.match(/m(\d+)-/);
+      if (m) adId = m[1];
+      const m2 = url.match(/\/(\d{9,})/);
+      if (!adId && m2) adId = m2[1];
+    }
+
+    return {
+      url,
+      title: clean(title),
+      priceRaw: clean(priceRaw),
+      priceEUR,
+      date: clean(date),
+      adId,
+      year,
+      mileageKm,
+      fuel,
+      transmission,
+      body,
+      options,
+      sellerName: clean(sellerName),
+      sellerCity: clean(sellerCity),
+      scrapedAt: new Date().toISOString(),
+      listUrlUsed: page.url(), // met cache-buster
+    };
+  }
+
+  return null;
+}
+
+async function waitForFiltersApplied(page) {
+  const deadline = Date.now() + 15000;
+
+  // helper: eerste niet-gesponsorde kaart
+  const getFirstNormalCard = async () => {
+    const cards = await page.$$('li.hz-Listing');
+    for (const card of cards) {
+      if (await card.$('.hz-Listing-priority')) continue;
+      const txt = (await card.textContent())?.toLowerCase() || '';
+      if (txt.includes('topzoekertje') || txt.includes('topadvertentie')) continue;
+      return card;
+    }
+    return null;
+  };
+
+  while (Date.now() < deadline) {
+    const card = await getFirstNormalCard();
+    if (card) {
+      const txt = (await card.textContent())?.toLowerCase() || '';
+      // NL + FR indicatoren dat de lijst net ververst/gesorteerd is
+      if (/\b(vandaag|gisteren|min|uur|heures|minute|minutes|aujourd’hui|aujourd'hui)\b/.test(txt)) {
+        return; // filters lijken actief
+      }
+    }
+    // probeer sorteermenu forceren
+    const sortBtn = await page
+      .locator('button:has-text("Sorteer"), [aria-label*="Sorteer"], button:has-text("Trier"), [aria-label*="Trier"]')
+      .first();
+    if (await sortBtn.count()) {
+      await sortBtn.click({ timeout: 1000 }).catch(() => {});
+      // klik "Datum: nieuwste eerst" (NL/FR varianten)
+      await page.locator('text=/Datum.*nieuwste|Date.*récen|récents/i').first().click({ timeout: 1000 }).catch(() => {});
+    }
+    await page.waitForTimeout(500);
+    await page.mouse.wheel(0, 400);
+  }
+  // geen harde garantie, maar we hebben het geprobeerd
+}
+
+/* ---------- utils ---------- */
 
 function addCacheBuster(u) {
   // voeg ?_ts=... vóór de '#...' in
@@ -227,6 +303,13 @@ function addCacheBuster(u) {
   const base = u.slice(0, i);
   const hash = u.slice(i);
   return base + (base.includes('?') ? '&' : '?') + ts + hash;
+}
+
+function readLast() {
+  try { return JSON.parse(fs.readFileSync(LAST_STATE_PATH, 'utf8')); } catch { return null; }
+}
+function writeLast(obj) {
+  try { fs.writeFileSync(LAST_STATE_PATH, JSON.stringify(obj)); } catch {}
 }
 
 async function safeText(scope, selector) {
